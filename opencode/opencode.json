@@ -1,0 +1,90 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "crowbot/gpt-6-astra",
+  "small_model": "crowbot/deepseek-v4.1-flash",
+  "share": "disabled",
+  "autoupdate": false,
+  "instructions": [
+    "{env:ASSISTANT_HOME}/memory/profile.md"
+  ],
+  "provider": {
+    "crowbot": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "crowbot",
+      "options": {
+        "baseURL": "https://api.crowbot.sh/v1",
+        "apiKey": "{env:CROWBOT_API_KEY}"
+      },
+      "models": {
+        "deepseek-v4.1-flash": {"name":"DeepSeek V4.1 Flash","limit":{"context":1048576,"output":128000},"cost":{"input":0.045,"output":0.18,"cache_read":0.0009},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
+        "gpt-6-astra": {"name":"GPT 6 Astra","limit":{"context":1048576,"output":272000},"cost":{"input":0.3,"output":1.5,"cache_read":0.03},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
+        "kimi-k3": {"name":"Kimi K3","limit":{"context":1048576,"output":1048576},"cost":{"input":0.27,"output":1.35,"cache_read":0.027},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
+        "crow-2": {"name":"GLM 5.3 [UNCENSORED]","limit":{"context":1000000,"output":32768},"cost":{"input":5,"output":5,"cache_read":0.5},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false}
+      }
+    }
+  },
+  "mcp": {
+    "hq": {
+      "type": "remote",
+      "url": "http://127.0.0.1:{env:HQ_PORT}/mcp",
+      "headers": {
+        "Authorization": "Bearer {env:HQ_MCP_TOKEN}"
+      },
+      "oauth": false,
+      "timeout": 15000
+    }
+  },
+  "tools": {
+    "hq_*": false
+  },
+  "agent": {
+    "assistant": {
+      "description": "Personal assistant you talk to over Telegram",
+      "mode": "primary",
+      "prompt": "{file:./prompts/assistant.md}",
+      "tools": {
+        "hq_*": true
+      },
+      "model": "crowbot/deepseek-v4.1-flash",
+      "variant": "max"
+    },
+    "worker": {
+      "description": "Autonomous background worker that owns one task end to end",
+      "mode": "primary",
+      "prompt": "{file:./prompts/worker.md}",
+      "model": "crowbot/deepseek-v4.1-flash",
+      "variant": "max"
+    }
+  },
+  "permission": {
+    "edit": "allow",
+    "webfetch": "allow",
+    "websearch": "allow",
+    "question": "allow",
+    "doom_loop": "ask",
+    "external_directory": {
+      "*": "ask",
+      "{env:ASSISTANT_HOME}/**": "allow",
+      "{env:PROJECTS_DIR}/**": "allow",
+      "/tmp/**": "allow"
+    },
+    "bash": {
+      "*": "allow",
+      "git push*": "ask",
+      "sudo *": "ask",
+      "su *": "ask",
+      "ssh *": "ask",
+      "scp *": "ask",
+      "rsync *": "ask",
+      "npm publish*": "ask",
+      "gh pr merge*": "ask",
+      "gh release*": "ask",
+      "gh repo delete*": "ask",
+      "docker push*": "ask",
+      "rm -rf /": "deny",
+      "rm -rf /*": "deny",
+      "rm -rf ~": "deny",
+      "rm -rf ~/*": "deny"
+    }
+  }
+}

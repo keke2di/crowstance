@@ -1,0 +1,15 @@
+[Unit]
+Description=crowstance: resource limits for the assistant and everything it runs
+Before=slices.target
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+TasksAccounting=yes
+CPUWeight=@CPU_WEIGHT@
+CPUQuota=@CPU_QUOTA@
+MemoryMax=@MEMORY_MAX@
+MemorySwapMax=@SWAP_MAX@
+IOWeight=@IO_WEIGHT@
+TasksMax=@TASKS_MAX@

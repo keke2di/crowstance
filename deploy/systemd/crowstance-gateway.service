@@ -1,0 +1,33 @@
+[Unit]
+Description=crowstance: Telegram gateway
+After=network-online.target crowstance-opencode.service
+Wants=network-online.target crowstance-opencode.service
+Requires=crowstance-opencode.service
+
+[Service]
+User=crow-gateway
+Group=crow-gateway
+Slice=crowstance.slice
+WorkingDirectory=/opt/crowstance/app
+EnvironmentFile=/etc/crowstance/gateway.env
+ExecStart=/opt/crowstance/node/bin/node src/index.ts
+Restart=always
+RestartSec=5
+StateDirectory=crowstance
+StateDirectoryMode=0700
+MemoryMax=768M
+OOMScoreAdjust=200
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/crowstance
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

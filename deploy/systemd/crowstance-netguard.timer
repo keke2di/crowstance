@@ -1,0 +1,9 @@
+[Unit]
+Description=crowstance: refresh the agent's network fence (picks up newly opened ports)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target

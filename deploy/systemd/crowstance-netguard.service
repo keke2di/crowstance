@@ -1,0 +1,10 @@
+[Unit]
+Description=crowstance: keep the agent away from other services on this machine
+After=network-online.target
+Before=crowstance-opencode.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/crowstance/app/deploy/netguard.sh apply
+# No RemainAfterExit: the timer re-runs this every few minutes, and a unit that stays
+# "active" after exiting is never started again, so the fence would never refresh.

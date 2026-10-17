@@ -1,0 +1,2 @@
+# Keep LF everywhere: deploy.sh ships this working tree to Linux (bash scripts, systemd units).
+* text=auto eol=lf

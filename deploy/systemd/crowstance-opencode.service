@@ -1,0 +1,48 @@
+[Unit]
+Description=crowstance: OpenCode server (the assistant's brain)
+After=network-online.target crowstance-netguard.service
+Requires=crowstance-netguard.service
+Wants=network-online.target
+
+[Service]
+User=crow-agent
+Group=crow-agent
+Slice=crowstance.slice
+WorkingDirectory=/home/crow-agent/assistant
+EnvironmentFile=/etc/crowstance/opencode.env
+Environment=HOME=/home/crow-agent
+Environment=PATH=/home/crow-agent/.local/bin:/home/crow-agent/.npm-global/bin:/opt/crowstance/bin:/opt/crowstance/node/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/crowstance/node/bin/opencode serve --hostname 127.0.0.1 --port ${OPENCODE_PORT}
+# Block the unit from reaching "active" until OpenCode actually answers its
+# health endpoint, so crowstance-gateway (Requires=+After=) only starts against
+# a ready server. health-check.sh reads OPENCODE_PORT from this EnvironmentFile.
+ExecStartPost=/opt/crowstance/app/deploy/health-check.sh --opencode-only --wait
+TimeoutStartSec=120
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+Nice=@NICE@
+# If something the agent runs eats all its memory, the kernel kills that process (not your other services),
+# and OpenCode keeps running.
+OOMScoreAdjust=500
+OOMPolicy=continue
+
+# Sandbox: the agent can write only to its own home and a private /tmp, can't see other users' homes,
+# and can't gain privileges (no sudo, no setuid).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=/home/crow-agent
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

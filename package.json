@@ -1,0 +1,36 @@
+{
+  "name": "crowstance",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal AI assistant: Telegram gateway for an OpenCode server",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env src/index.ts",
+    "start": "node --env-file-if-exists=.env src/index.ts",
+    "opencode": "node scripts/dev-opencode.ts",
+    "dev:smoke": "bash scripts/dev-smoke.sh",
+    "doctor": "node --env-file-if-exists=.env src/doctor.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@grammyjs/auto-retry": "^2.0.2",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@opencode-ai/sdk": "1.18.34",
+    "better-sqlite3": "^13.0.3",
+    "croner": "^10.0.1",
+    "eventsource-parser": "^4.1.1",
+    "grammy": "^1.46.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  }
+}

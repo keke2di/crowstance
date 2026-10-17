@@ -1,0 +1,85 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "stub/stub-model",
+  "small_model": "stub/stub-model",
+  "share": "disabled",
+  "autoupdate": false,
+  "instructions": ["{env:ASSISTANT_HOME}/memory/profile.md"],
+  "provider": {
+    "stub": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "local dev stub",
+      "options": {
+        "baseURL": "http://127.0.0.1:4097/v1",
+        "apiKey": "dev-only-no-provider-key"
+      },
+      "models": {
+        "stub-model": {
+          "name": "Local development stub",
+          "limit": {"context": 32768, "output": 4096},
+          "cost": {"input": 0, "output": 0, "cache_read": 0},
+          "tool_call": false,
+          "reasoning": false,
+          "temperature": true,
+          "attachment": false
+        }
+      }
+    }
+  },
+  "mcp": {
+    "hq": {
+      "type": "remote",
+      "url": "http://127.0.0.1:{env:HQ_PORT}/mcp",
+      "headers": {"Authorization": "Bearer {env:HQ_MCP_TOKEN}"},
+      "oauth": false,
+      "timeout": 15000
+    }
+  },
+  "tools": {"hq_*": false},
+  "agent": {
+    "assistant": {
+      "description": "Personal assistant you talk to over Telegram",
+      "mode": "primary",
+      "prompt": "{file:./prompts/assistant.md}",
+      "tools": {"hq_*": true},
+      "model": "stub/stub-model"
+    },
+    "worker": {
+      "description": "Autonomous background worker that owns one task end to end",
+      "mode": "primary",
+      "prompt": "{file:./prompts/worker.md}",
+      "model": "stub/stub-model"
+    }
+  },
+  "permission": {
+    "edit": "allow",
+    "webfetch": "allow",
+    "websearch": "allow",
+    "question": "allow",
+    "doom_loop": "ask",
+    "external_directory": {
+      "*": "ask",
+      "{env:ASSISTANT_HOME}/**": "allow",
+      "{env:PROJECTS_DIR}/**": "allow",
+      "/tmp/**": "allow"
+    },
+    "bash": {
+      "*": "allow",
+      "git push*": "ask",
+      "sudo *": "ask",
+      "su *": "ask",
+      "ssh *": "ask",
+      "scp *": "ask",
+      "rsync *": "ask",
+      "npm publish*": "ask",
+      "gh pr merge*": "ask",
+      "gh release*": "ask",
+      "gh repo delete*": "ask",
+      "docker push*": "ask",
+      "rm -rf /": "deny",
+      "rm -rf /*": "deny",
+      "rm -rf ~": "deny",
+      "rm -rf ~/*": "deny"
+    }
+  }
+}

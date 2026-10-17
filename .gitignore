@@ -1,0 +1,12 @@
+node_modules/
+data/
+.env
+.env.*
+!.env.example
+deploy/secrets.env
+*.db
+*.db-*
+.dev-data/
+.dev-assistant/
+.dev-projects/
+coverage/
