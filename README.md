@@ -4,7 +4,7 @@ A personal AI assistant you text on Telegram. It lives on your VPS, works around
 [OpenCode](https://opencode.ai) with your own model credentials.
 
 ```
-You (Telegram) ──► gateway (this repo, Node 24) ──► opencode serve (1.18.x) ──► crowbot (DeepSeek, GPT, …) / any provider
+You (Telegram) ──► gateway (this repo, Node 24) ──► opencode serve (1.18.x) ──► crowbot / any provider
                      │  allowlist, debounce, typing, buttons        ├─ main session  (agent "assistant", ~/assistant)
                      │  tasks, reminders, jobs, monitors (SQLite)   └─ worker sessions (agent "worker", ~/projects/<task>)
                      └─ 127.0.0.1:7801  /mcp (hq_* tools) · /notify (monitor scripts)
@@ -154,14 +154,11 @@ The password is `OPENCODE_SERVER_PASSWORD` in `/etc/crowstance/opencode.env`. If
 
 ## Models and providers
 
-Models come through [crowbot](https://crowbot.sh), an OpenAI-compatible gateway. Your 16-digit account number is
-the API key (`CROWBOT_API_KEY`). The defaults in `opencode/opencode.json`:
-
-| Role | Model | $/M tokens in / out |
-|---|---|---|
-| Chat (the `assistant` agent) | `crowbot/deepseek-v4.1-flash` | 0.045 / 0.18 (cached input 0.0009) |
-| Background workers (`worker` agent) | `crowbot/deepseek-v4.1-flash` | 0.045 / 0.18 (cached input 0.0009) |
-| Also selectable | `crowbot/kimi-k3` (coding), `crowbot/crow-2` (GLM 5.3, uncensored build) | 0.27 / 1.35 · 5.00 / 5.00 |
+Models are configured in `opencode/opencode.json`. The checked-in default is
+[crowbot](https://crowbot.sh), an OpenAI-compatible gateway; put your crowbot key in
+`CROWBOT_API_KEY`. Model availability, context limits and pricing are set by the provider
+and change over time, so treat the checked-in model list as a starting point and check your
+provider for current details.
 
 - **Switch at runtime:** `/model` in Telegram. Chat and workers can use different models.
 - **New provider:** the `provider` block in `opencode/opencode.json` is only the default crowbot setup. Replace it with any OpenCode-compatible provider and list the models you want there.
