@@ -526,4 +526,88 @@ export class Store {
     })();
     return result;
   }
+
+  // ---- vault (ciphertext only; the key never lives in this database) ----
+
+  vaultPut(e: { handle: string; service: string; kind: string; ciphertext: Buffer; nonce: Buffer; tag: Buffer; note: string | null }) {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO vault(handle,service,kind,ciphertext,nonce,tag,note,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(handle) DO UPDATE SET service=excluded.service, kind=excluded.kind, ciphertext=excluded.ciphertext,
+           nonce=excluded.nonce, tag=excluded.tag, note=excluded.note, updated_at=excluded.updated_at`,
+      )
+      .run(e.handle, e.service, e.kind, e.ciphertext, e.nonce, e.tag, e.note, now, now);
+  }
+  vaultGet(handle: string) {
+    return this.db.prepare("SELECT * FROM vault WHERE handle = ?").get(handle) as VaultRow | undefined;
+  }
+  vaultList(): VaultMeta[] {
+    return this.db.prepare("SELECT handle,service,kind,note,created_at,updated_at,last_used_at FROM vault ORDER BY handle").all() as VaultMeta[];
+  }
+  vaultRemove(handle: string) {
+    return this.db.prepare("DELETE FROM vault WHERE handle = ?").run(handle).changes > 0;
+  }
+  vaultTouch(handle: string) {
+    this.db.prepare("UPDATE vault SET last_used_at = ? WHERE handle = ?").run(Date.now(), handle);
+  }
+
+  // ---- action audit ----
+
+  auditAction(a: { sessionID?: string; taskSlug?: string; service?: string; action: string; detail?: string; rationale?: string; costEstimateUsd?: number; consent?: string; consentRef?: string; status?: string; correlationID?: string }) {
+    const info = this.db
+      .prepare(
+        `INSERT INTO action_audit(created_at,session_id,task_slug,service,action,detail,rationale,cost_estimate_usd,consent,consent_ref,status,correlation_id)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        Date.now(),
+        a.sessionID ?? null,
+        a.taskSlug ?? null,
+        a.service ?? null,
+        a.action,
+        a.detail ?? null,
+        a.rationale ?? null,
+        a.costEstimateUsd ?? null,
+        a.consent ?? "none",
+        a.consentRef ?? null,
+        a.status ?? "prepared",
+        a.correlationID ?? currentCorrelationId() ?? null,
+      );
+    return Number(info.lastInsertRowid);
+  }
+  updateAuditStatus(id: number, status: string) {
+    this.db.prepare("UPDATE action_audit SET status = ? WHERE id = ?").run(status, id);
+  }
+  recentActions(limit = 20) {
+    return this.db.prepare("SELECT * FROM action_audit ORDER BY id DESC LIMIT ?").all(limit) as ActionAuditRow[];
+  }
+
+  // ---- task-scoped permission grants ----
+
+  grantPermission(sessionID: string, permission: string, patterns: string[]) {
+    this.db.prepare("INSERT INTO permission_grants(session_id,permission,patterns,created_at) VALUES(?,?,?,?)").run(sessionID, permission, JSON.stringify(patterns), Date.now());
+  }
+  grantsFor(sessionID: string) {
+    return this.db.prepare("SELECT * FROM permission_grants WHERE session_id = ?").all(sessionID) as PermissionGrantRow[];
+  }
 }
+
+export type VaultRow = { handle: string; service: string; kind: string; ciphertext: Buffer; nonce: Buffer; tag: Buffer; note: string | null; created_at: number; updated_at: number; last_used_at: number | null };
+export type VaultMeta = Omit<VaultRow, "ciphertext" | "nonce" | "tag">;
+export type PermissionGrantRow = { id: number; session_id: string; permission: string; patterns: string; created_at: number };
+export type ActionAuditRow = {
+  id: number;
+  created_at: number;
+  session_id: string | null;
+  task_slug: string | null;
+  service: string | null;
+  action: string;
+  detail: string | null;
+  rationale: string | null;
+  cost_estimate_usd: number | null;
+  consent: string;
+  consent_ref: string | null;
+  status: string;
+  correlation_id: string | null;
+};

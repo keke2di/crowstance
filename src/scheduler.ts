@@ -81,6 +81,12 @@ export class Scheduler {
   isQuiet(now = new Date()): boolean {
     const override = this.store.get(KEY_QUIET);
     if (override === "on") return true;
+    if (override?.startsWith("on-until:")) {
+      const until = Number(override.slice(9));
+      if (until > now.getTime()) return true;
+      this.store.delete(KEY_QUIET); // expired
+      return this.cfg.quietHours ? inRange(minutesOfDay(now), this.cfg.quietHours) : false;
+    }
     if (override === "off") return false;
     return this.cfg.quietHours ? inRange(minutesOfDay(now), this.cfg.quietHours) : false;
   }

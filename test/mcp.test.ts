@@ -66,6 +66,8 @@ describe("/mcp", () => {
     const list = await rpc("tools/list", {});
     const names = (list.body?.result?.tools as { name: string }[]).map((t) => t.name).sort();
     expect(names).toEqual([
+      "action_list",
+      "action_record",
       "jobs",
       "location_share",
       "monitor_add",
@@ -82,6 +84,7 @@ describe("/mcp", () => {
       "task_status",
       "task_stop",
       "unschedule",
+      "vault_list",
     ]);
   });
 

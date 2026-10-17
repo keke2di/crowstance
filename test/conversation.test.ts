@@ -260,7 +260,7 @@ describe("Conversation delivery edge cases", () => {
     expect(oc.prompts[0]!.text).not.toContain("background task");
   });
 
-  it("retries once quietly after a provider hiccup, then explains if it fails again", async () => {
+  it("retries quietly after a provider hiccup, then explains if it keeps failing", async () => {
     const { cfg, store, oc, chat } = setup();
     const conv = new Conversation({ cfg, store, oc: oc.asOpenCode(), chat, isQuiet: () => false, retryDelayMs: 0 });
     live.push(conv);
@@ -277,9 +277,15 @@ describe("Conversation delivery edge cases", () => {
     expect(oc.prompts[1]!.text).toContain("temporary error");
     oc.reply(sid, "", { error: upstream });
     await conv.onMainIdle();
+    expect(chat.sent).toHaveLength(0); // still retrying quietly
+
+    await conv.pump();
+    expect(oc.prompts).toHaveLength(3);
+    oc.reply(sid, "", { error: upstream });
+    await conv.onMainIdle();
     expect(chat.sent.at(-1)!.text).toContain("having trouble right now");
     await conv.pump();
-    expect(oc.prompts).toHaveLength(2); // only one retry
+    expect(oc.prompts).toHaveLength(3); // retries exhausted
   });
 
   it("tells the user once (not every tick) when the reasoning budget is spent", async () => {

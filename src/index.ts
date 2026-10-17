@@ -1,4 +1,6 @@
 import path from "node:path";
+import fs from "node:fs";
+import { InlineKeyboard } from "grammy";
 import { Approvals } from "./approvals.ts";
 import { loadConfig, type Config } from "./config.ts";
 import { Conversation } from "./conversation.ts";
@@ -9,8 +11,35 @@ import { startHqServer, type DependencyCheck, type ReadinessReport } from "./mcp
 import { OpenCode, type GlobalEvent } from "./opencode.ts";
 import { Scheduler } from "./scheduler.ts";
 import { Tasks } from "./tasks.ts";
-import { createBot, registerHandlers } from "./telegram/bot.ts";
+import { COMMAND_MENU, createBot, registerHandlers } from "./telegram/bot.ts";
 import { TelegramChat } from "./telegram/chat.ts";
+import { loadVaultKey, Vault } from "./vault.ts";
+import { MediaProcessor, TesseractOcr, WhisperCppStt } from "./media.ts";
+
+/** Build the media pipeline from config; undefined when neither engine is configured. */
+function buildMedia(cfg: Config, botToken: string): MediaProcessor | undefined {
+  const ocr = cfg.TESSERACT_BIN ? new TesseractOcr(cfg.TESSERACT_BIN, cfg.TESSERACT_LANG) : undefined;
+  const stt = cfg.WHISPER_BIN && cfg.WHISPER_MODEL ? new WhisperCppStt(cfg.WHISPER_BIN, cfg.WHISPER_MODEL, cfg.WHISPER_LANG, cfg.FFMPEG_BIN) : undefined;
+  if (!ocr && !stt) return undefined;
+  const apiRoot = `https://api.telegram.org/file/bot${botToken}`;
+  return new MediaProcessor({
+    ...(ocr ? { ocr } : {}),
+    ...(stt ? { stt } : {}),
+    download: async (fileId, dest) => {
+      const res = await fetch(`https://api.telegram.org/bot${botToken}/getFile`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file_id: fileId }),
+      });
+      const meta = (await res.json()) as { ok: boolean; result?: { file_path?: string }; description?: string };
+      if (!meta.ok || !meta.result?.file_path) throw new Error(`getFile failed: ${meta.description ?? "unknown"}`);
+      const file = await fetch(`${apiRoot}/${meta.result.file_path}`);
+      if (!file.ok || !file.body) throw new Error(`download failed: HTTP ${file.status}`);
+      await fs.promises.writeFile(dest, Buffer.from(await file.arrayBuffer()));
+      return dest;
+    },
+  });
+}
 
 const log = logger("main");
 
@@ -32,6 +61,7 @@ async function main() {
   setLogLevel(cfg.LOG_LEVEL);
 
   const store = new Store(path.join(cfg.DATA_DIR, "assistant.db"));
+  const vault = new Vault(store, loadVaultKey(cfg));
   const oc = new OpenCode({ url: cfg.OPENCODE_URL, username: cfg.OPENCODE_SERVER_USERNAME, password: cfg.OPENCODE_SERVER_PASSWORD });
   const bot = createBot(cfg.TELEGRAM_BOT_TOKEN);
   const chat = new TelegramChat(bot.api, cfg.OWNER_TELEGRAM_ID);
@@ -77,7 +107,22 @@ async function main() {
   let tasks: Tasks;
   const conversation = new Conversation({ cfg, store, oc, chat, isQuiet, delivery, delegate: (title, brief) => tasks.start({ title, brief }) });
   const kick = () => void conversation.pump();
-  tasks = new Tasks({ cfg, store, oc, onUpdate: kick });
+  tasks = new Tasks({
+    cfg,
+    store,
+    oc,
+    onUpdate: kick,
+    onStuck: (t, idleFor) => {
+      const kb = new InlineKeyboard().text("Keep waiting", `st:k:${t.slug}`).text("Stop it", `st:s:${t.slug}`);
+      void chat
+        .sendHtml(`⚠️ Task <b>${t.slug}</b> ("${t.title.replace(/</g, "&lt;")}") has shown no activity for ${idleFor}. It may be stuck.`, { keyboard: kb })
+        .catch((err) => {
+          log.warn(`stuck-task alert not delivered (${(err as Error).message}); falling back to an update note`);
+          store.enqueueUpdate("task", `Task ${t.slug} ("${t.title}") has shown no activity for ${idleFor}. It may be stuck.`);
+          kick();
+        });
+    },
+  });
   const labelFor = (sessionID: string) => {
     if (sessionID === conversation.sessionID) return "me (main chat)";
     const t = store.taskBySession(sessionID);
@@ -98,7 +143,7 @@ async function main() {
   });
 
   // The MCP endpoint must be up before OpenCode tries to connect to it.
-  const hq = await startHqServer({ cfg, store, tasks, scheduler, onUpdate: kick, readiness });
+  const hq = await startHqServer({ cfg, store, tasks, scheduler, onUpdate: kick, vault, readiness });
   await oc.waitUntilHealthy();
   await ensureHqConnected(oc, cfg);
   await conversation.ensureMainSession();
@@ -171,9 +216,10 @@ async function main() {
   })();
 
   scheduler.start();
-  registerHandlers(bot, { cfg, store, oc, conversation, tasks, approvals, scheduler, labelFor });
-  // No published command menu: the chat is just chat. Commands still work if typed.
-  await bot.api.setMyCommands([]).catch((err) => log.warn(`could not clear the command menu: ${(err as Error).message}`));
+  const media = buildMedia(cfg, cfg.TELEGRAM_BOT_TOKEN);
+  if (media) log.info(`media pipeline: ${media.capabilities()}`);
+  registerHandlers(bot, { cfg, store, oc, conversation, tasks, approvals, scheduler, labelFor, ...(media ? { media } : {}) });
+  await bot.api.setMyCommands(COMMAND_MENU).catch((err) => log.warn(`could not set the command menu: ${(err as Error).message}`));
   bot.start({ onStart: (me) => log.info(`telegram bot @${me.username} is listening (owner ${cfg.OWNER_TELEGRAM_ID})`) }).catch((err) => {
     log.error("Telegram polling stopped (bad TELEGRAM_BOT_TOKEN, or another instance is polling the same bot)", err);
     process.exit(1);

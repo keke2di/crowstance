@@ -179,9 +179,20 @@ provider for current details.
 | `/new` | clean chat; the assistant saves memory and where you left off first, and picks it up only when asked |
 | `/model` | show or switch models |
 | `/cost` | spend today and this month |
-| `/quiet on\|off\|auto` | hold non-urgent updates |
+| `/quiet on\|off\|today\|auto` | hold non-urgent updates (`today` until midnight) |
+| `/actions` | recent real-world actions taken on your behalf |
 
-Everything else is just conversation. Reply to a question message to give a free-form answer.
+Everything else is just conversation. Reply to a question message to give a free-form answer. Photos and voice messages work too: they run through local OCR (tesseract) and speech-to-text (whisper.cpp) so the text-only models can read them — nothing leaves your server. Setup installs both; locally, set `TESSERACT_BIN` / `WHISPER_BIN` + `WHISPER_MODEL` in `.env`.
+
+## Real-world actions (foundation)
+
+The assistant can prepare actions on your behalf (bookings, orders) — everything up to the irreversible step — and you confirm with one tap. The rails, built but not yet wired to any live service:
+
+- **Vault**: credentials are encrypted at rest (AES-256-GCM, key in `<DATA_DIR>/vault.key`) and used only by opaque handle; the agent can list handles (`hq_vault_list`) but can never read values. Add one with `echo "secret" | node scripts/vault-add.ts <handle> <service> [note]`.
+- **Audit**: every prepared or taken action is recorded (`hq_action_record`) with rationale, cost estimate and consent reference; `/actions` shows the trail. Completing an action without recorded explicit consent is refused.
+- **Task-scoped consent**: permission prompts have a third button, "✅ Task", which auto-allows later requests with the same permission and patterns *for that session only*. There is still no global "always".
+
+See `docs/ACTIONS.md` for the design of the first live integration.
 
 ## Monitoring pattern
 

@@ -12,8 +12,8 @@ import { truncate } from "./text.ts";
 
 const log = logger("approvals");
 
-type Reply = "once" | "reject";
-const REPLY_LABEL: Record<Reply, string> = { once: "✅ Allowed once", reject: "❌ Denied" };
+type Reply = "once" | "reject" | "task";
+const REPLY_LABEL: Record<Reply, string> = { once: "✅ Allowed once", reject: "❌ Denied", task: "✅ Allowed for this task" };
 
 type QuestionState = { answers: (string[] | null)[]; selected: number[][] };
 
@@ -60,15 +60,43 @@ export class Approvals {
     const row = this.store.insertApproval({ request_id: req.id, kind: "permission", session_id: req.sessionID, directory, payload: JSON.stringify(req) });
     log.info(`permission asked for ${this.labelFor(req.sessionID)}`, { requestID: req.id, correlationId: row.correlation_id });
     if (row.resolved_at) return;
+    // Task-scoped consent: a previous "allow for this task" covers matching requests automatically.
+    if (this.grantCovers(req.sessionID, req)) {
+      this.inFlight.add(req.id);
+      try {
+        await this.oc.replyPermission(req.id, row.directory, "once");
+        await this.resolve(row, "task-grant", false);
+        log.info(`permission auto-allowed by a task grant`, { requestID: req.id });
+      } catch (err) {
+        if (statusOf(err) !== 404) throw err;
+        await this.resolve(row, "expired");
+      } finally {
+        this.inFlight.delete(req.id);
+      }
+      return;
+    }
     const ids = JSON.parse(row.chat_message_ids) as number[];
     if (ids.length) return;
     const { verb, detail } = describePermission(req);
     const html = `🔐 <b>${escapeHtml(this.labelFor(req.sessionID))}</b> ${escapeHtml(verb)}:\n<pre>${escapeHtml(truncate(detail, 1500))}</pre>`;
     const keyboard = new InlineKeyboard()
       .text("✅ Once", `p:${req.id}:once`)
+      .text("✅ Task", `p:${req.id}:task`)
       .text("❌ Deny", `p:${req.id}:reject`);
     const id = await this.chat.sendHtml(html, { keyboard, silent: this.isQuiet() });
     this.store.updateApproval(req.id, { chat_message_ids: JSON.stringify([id]), presentation: JSON.stringify({ steps: [true] }) });
+  }
+
+  /** True when an earlier "allow for this task" grant covers every pattern of this request. */
+  private grantCovers(sessionID: string, req: PermissionRequest): boolean {
+    const grants = this.store.grantsFor(sessionID).filter((g) => g.permission === req.permission);
+    if (!grants.length) return false;
+    const wanted = req.patterns.filter(Boolean);
+    if (!wanted.length) return false;
+    return grants.some((g) => {
+      const allowed = new Set(JSON.parse(g.patterns) as string[]);
+      return wanted.every((p) => allowed.has(p));
+    });
   }
 
   async answerPermission(requestID: string, reply: Reply, messageID?: number): Promise<string> {
@@ -77,7 +105,11 @@ export class Approvals {
     if (messageID !== undefined && !(JSON.parse(row.chat_message_ids) as number[]).includes(messageID)) return "That prompt does not match";
     this.inFlight.add(requestID);
     try {
-      await this.oc.replyPermission(requestID, row.directory, reply);
+      await this.oc.replyPermission(requestID, row.directory, reply === "task" ? "once" : reply);
+      if (reply === "task") {
+        const req = JSON.parse(row.payload) as PermissionRequest;
+        this.store.grantPermission(row.session_id, req.permission, req.patterns.filter(Boolean));
+      }
     } catch (err) {
       if (statusOf(err) !== 404) throw err;
       await this.resolve(row, "expired");
@@ -231,7 +263,7 @@ export class Approvals {
     if (!rewrite) return;
     const ids = JSON.parse(row.chat_message_ids) as number[];
     const note =
-      resolution in REPLY_LABEL ? REPLY_LABEL[resolution as Reply] : resolution === "dismissed" ? "🚫 Dismissed" : resolution === "elsewhere" ? "✔️ Answered elsewhere" : "⌛ Expired";
+      resolution in REPLY_LABEL ? REPLY_LABEL[resolution as Reply] : resolution === "task-grant" ? "✅ Auto-allowed (task grant)" : resolution === "dismissed" ? "🚫 Dismissed" : resolution === "elsewhere" ? "✔️ Answered elsewhere" : "⌛ Expired";
     for (const id of ids) {
       await this.chat.editHtml(id, `${this.renderResolved(row)}\n\n<i>${escapeHtml(note)}</i>`).catch((err) => log.debug(`edit failed: ${(err as Error).message}`));
     }

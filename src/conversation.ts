@@ -78,11 +78,13 @@ export class Conversation {
   private typingTimer: NodeJS.Timeout | undefined;
   private rotatePending = false;
   private rotateMode: RotateMode = "manual";
-  /** 0 for a fresh turn, 1 for its automatic retry after a provider hiccup. */
+  /** 0 for a fresh turn, then 1/2 for automatic retries after a provider hiccup. */
   private turnAttempt = 0;
   private retryPending: { kind: TurnKind; urgent: boolean; at: number; attempt: number } | undefined;
   private readonly lastNotice = new Map<string, number>();
   private readonly retryDelayMs: number;
+  /** Maximum automatic retries of a turn that hit a provider hiccup. */
+  private readonly maxRetries = 2;
   private verified = false;
   private chain: Promise<unknown> = Promise.resolve();
 
@@ -275,6 +277,7 @@ export class Conversation {
         variant: this.cfg.REASONING_VARIANT,
       });
     } catch (err) {
+      this.store.updateTurn(turn.id, "failed", sessionID);
       this.busy = false;
       this.turn = undefined;
       this.turnID = undefined;
@@ -319,7 +322,7 @@ export class Conversation {
   }
 
   async watchdog() {
-    if (this.busy && Date.now() - this.busySince > 45_000) await this.reconcile();
+    if (this.busy && Date.now() - this.busySince > this.cfg.BUSY_WATCHDOG_SEC * 1000) await this.reconcile();
     else if (!this.busy) {
       await this.pump();
       await this.maybeAutoRotate();
@@ -377,20 +380,22 @@ export class Conversation {
     const last = done.at(-1)!.info as { tokens?: { input?: number; cache?: { read?: number } } };
     if (last.tokens) this.store.set(KEY_CONTEXT, String((last.tokens.input ?? 0) + (last.tokens.cache?.read ?? 0)));
 
-    // A provider hiccup with nothing said yet: retry the turn once, quietly, before telling the user.
+    // A provider hiccup with nothing said yet: retry the turn, quietly, before telling the user.
     const transient = !reply && errors.length > 0 && errors.every((e) => TRANSIENT_ERROR.test(e));
-    if (transient && attempt === 0 && (kind === "user" || kind === "update")) {
+    if (transient && attempt < this.maxRetries && (kind === "user" || kind === "update")) {
       for (const m of done) delivered.add(m.info.id);
       this.store.set(KEY_DELIVERED, JSON.stringify([...delivered].slice(-300)));
       this.store.updateTurn(turn.id, "done", sessionID);
-      this.retryPending = { kind, urgent, at: Date.now() + this.retryDelayMs, attempt: 1 };
-      log.warn(`model provider hiccup (${truncate(errors.at(-1)!, 160)}); retrying in ${Math.round(this.retryDelayMs / 1000)}s`);
+      // Bounded backoff: retryDelay, 4×retryDelay, each with ±25% jitter.
+      const delay = Math.floor(this.retryDelayMs * 4 ** attempt * (0.75 + Math.random() * 0.5));
+      this.retryPending = { kind, urgent, at: Date.now() + delay, attempt: attempt + 1 };
+      log.warn(`model provider hiccup (${truncate(errors.at(-1)!, 160)}); retry ${attempt + 1}/${this.maxRetries} in ${Math.round(delay / 1000)}s`);
       return;
     }
     const errorNotice = !errors.length
       ? ""
       : transient
-        ? "⚠️ My model provider is having trouble right now (it failed twice in a row). Try again in a bit."
+        ? "⚠️ My model provider is having trouble right now (several attempts failed). Try again in a bit."
         : `⚠️ Something went wrong on my side: ${truncate(errors.at(-1)!, 400)}`;
 
     const correlation = turn.correlation_id ?? newCorrelationId("out");

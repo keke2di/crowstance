@@ -1,5 +1,6 @@
 import { autoRetry } from "@grammyjs/auto-retry";
 import { Bot, InlineKeyboard, type Context } from "grammy";
+import type { Message } from "grammy/types";
 import type { Approvals } from "../approvals.ts";
 import type { Config } from "../config.ts";
 import { KEY_CHAT_MODEL, type Conversation } from "../conversation.ts";
@@ -10,6 +11,22 @@ import { crowbotBalance } from "../provider.ts";
 import { KEY_QUIET, type Scheduler } from "../scheduler.ts";
 import { KEY_WORKER_MODEL, UserError, type Tasks } from "../tasks.ts";
 import { startOfLocalDay, startOfLocalMonth, usd } from "../text.ts";
+import type { MediaKind, MediaProcessor } from "../media.ts";
+
+/** Pick the best-quality media attachment from a message, respecting the size cap. */
+function pickMedia(msg: Message | undefined, maxBytes: number): { kind: MediaKind; fileId: string } | undefined {
+  if (!msg) return undefined;
+  if (msg.photo?.length) {
+    const best = msg.photo.at(-1)!;
+    if ((best.file_size ?? 0) <= maxBytes) return { kind: "photo", fileId: best.file_id };
+    return undefined;
+  }
+  if (msg.voice && (msg.voice.file_size ?? 0) <= maxBytes) return { kind: "voice", fileId: msg.voice.file_id };
+  if (msg.audio && (msg.audio.file_size ?? 0) <= maxBytes) return { kind: "audio", fileId: msg.audio.file_id };
+  const doc = msg.document;
+  if (doc && /^image\//.test(doc.mime_type ?? "") && (doc.file_size ?? 0) <= maxBytes) return { kind: "document-image", fileId: doc.file_id };
+  return undefined;
+}
 
 const log = logger("telegram");
 
@@ -22,6 +39,7 @@ export type BotDeps = {
   approvals: Approvals;
   scheduler: Scheduler;
   labelFor: (sessionID: string) => string;
+  media?: MediaProcessor;
 };
 
 const HELP = `Just text me like you would a person: ask questions, hand me work, ask how things are going.
@@ -33,7 +51,18 @@ Long jobs run in the background and I'll tell you when they're done. When someth
 /new: clean chat (ask me to pick up where we left off)
 /model: switch models
 /cost: spend so far
-/quiet on|off|auto: hold non-urgent updates`;
+/quiet on|off|auto|today: hold non-urgent updates
+/actions: recent outward-facing actions`;
+
+/** Minimal command menu for discoverability; the chat is still just chat. */
+export const COMMAND_MENU = [
+  { command: "tasks", description: "Background work" },
+  { command: "stop", description: "Interrupt me / stop a task" },
+  { command: "new", description: "Clean chat" },
+  { command: "quiet", description: "Hold non-urgent updates" },
+  { command: "cost", description: "Spend so far" },
+  { command: "help", description: "What I can do" },
+];
 
 export function createBot(token: string) {
   const bot = new Bot(token);
@@ -60,6 +89,20 @@ export function registerHandlers(bot: Bot, d: BotDeps) {
 
   bot.command("tasks", async (ctx) => {
     await ctx.reply(await d.tasks.list(72));
+  });
+
+  bot.command("actions", async (ctx) => {
+    const rows = d.store.recentActions(15);
+    if (!rows.length) return void (await ctx.reply("No actions recorded yet."));
+    await ctx.reply(
+      rows
+        .map(
+          (r) =>
+            `#${r.id} ${new Date(r.created_at).toISOString().slice(0, 16).replace("T", " ")} [${r.status}] ${r.action}` +
+            `${r.service ? ` (${r.service})` : ""}${r.cost_estimate_usd != null ? ` ~${usd(r.cost_estimate_usd)}` : ""}, consent: ${r.consent}`,
+        )
+        .join("\n"),
+    );
   });
 
   bot.command("stop", async (ctx) => {
@@ -102,10 +145,15 @@ export function registerHandlers(bot: Bot, d: BotDeps) {
   bot.command("quiet", async (ctx) => {
     const arg = ctx.match.trim().toLowerCase();
     if (arg === "on" || arg === "off") d.store.set(KEY_QUIET, arg);
-    else if (arg === "auto") d.store.delete(KEY_QUIET);
-    else if (arg) return void (await ctx.reply("Use /quiet on, /quiet off or /quiet auto."));
+    else if (arg === "today") {
+      const midnight = new Date();
+      midnight.setHours(24, 0, 0, 0);
+      d.store.set(KEY_QUIET, `on-until:${midnight.getTime()}`);
+    } else if (arg === "auto") d.store.delete(KEY_QUIET);
+    else if (arg) return void (await ctx.reply("Use /quiet on, /quiet off, /quiet today or /quiet auto."));
     const mode = d.store.get(KEY_QUIET) ?? `auto (${d.cfg.QUIET_HOURS ?? "no quiet hours set"})`;
-    await ctx.reply(`Quiet mode: ${mode}. ${d.scheduler.isQuiet() ? "Holding non-urgent updates right now." : "Updates go out as they happen."}`);
+    const label = mode.startsWith("on-until:") ? "on for the rest of today" : mode;
+    await ctx.reply(`Quiet mode: ${label}. ${d.scheduler.isQuiet() ? "Holding non-urgent updates right now." : "Updates go out as they happen."}`);
   });
 
   bot.command("model", async (ctx) => {
@@ -145,7 +193,18 @@ export function registerHandlers(bot: Bot, d: BotDeps) {
     });
   });
 
-  bot.on("message", (ctx) => ctx.reply("I can only read text for now. Files, photos and voice notes are coming soon."));
+  bot.on("message", async (ctx) => {
+    // Photos, voice notes, audio and image documents become text via the media pipeline
+    // (local OCR/STT); everything else is still rejected politely.
+    const anyMedia = ctx.message.photo?.length || ctx.message.voice || ctx.message.audio || /^image\//.test(ctx.message.document?.mime_type ?? "");
+    const media = pickMedia(ctx.message, d.cfg.MEDIA_MAX_MB * 1024 * 1024);
+    if (anyMedia && !media) return void (await ctx.reply(`That's too big for me to read (limit ${d.cfg.MEDIA_MAX_MB} MB).`));
+    if (!media || !d.media) return void (await ctx.reply(`I can only read text for now${d.media ? `, plus ${d.media.capabilities()}` : ""}.`));
+    await ctx.react("👀").catch(() => {});
+    const text = await d.media.process(media.kind, media.fileId, ctx.message.caption ?? undefined);
+    if (text === undefined) return void (await ctx.reply(`I can't read ${media.kind === "photo" || media.kind === "document-image" ? "images" : "voice messages"} on this setup yet — no engine configured.`));
+    d.conversation.onUserMessage({ text, at: new Date(ctx.message.date * 1000), replyTo: ctx.message.reply_to_message?.text });
+  });
 
   bot.catch((err) => {
     const e = err.error;
@@ -170,13 +229,27 @@ async function modelChoices(d: BotDeps): Promise<string[]> {
 async function handleCallback(ctx: Context, d: BotDeps, kind: string, rest: string[]): Promise<string | undefined> {
   switch (kind) {
     case "p":
-      return d.approvals.answerPermission(rest[0]!, rest[1] as "once" | "reject", ctx.callbackQuery?.message?.message_id);
+      return d.approvals.answerPermission(rest[0]!, rest[1] as "once" | "reject" | "task", ctx.callbackQuery?.message?.message_id);
     case "q":
       return d.approvals.tapOption(rest[0]!, Number(rest[1]), Number(rest[2]), ctx.callbackQuery?.message?.message_id);
     case "qd":
       return d.approvals.submitMultiple(rest[0]!, Number(rest[1]), ctx.callbackQuery?.message?.message_id);
     case "qx":
       return d.approvals.dismissQuestion(rest[0]!, ctx.callbackQuery?.message?.message_id);
+    case "st": {
+      const [action, slug] = rest as [string, string];
+      const messageId = ctx.callbackQuery?.message?.message_id;
+      if (action === "k") {
+        if (messageId) await ctx.editMessageText(`OK, leaving ${slug} alone. I'll only mention it again if it ends or goes quiet after new activity.`);
+        return "Keeping it";
+      }
+      if (action === "s") {
+        const t = await d.tasks.stop(slug);
+        if (messageId) await ctx.editMessageText(`Stopped ${t.slug}.`);
+        return `Stopped ${t.slug}`;
+      }
+      return "Unknown button";
+    }
     case "mt": {
       const target = rest[0] as Target;
       const choices = (await modelChoices(d)).slice(0, 40);

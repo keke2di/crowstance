@@ -36,7 +36,14 @@ spend) and `applyRetention()` (bounded terminal history; never pending work).
 ### `src/migrations.ts`
 Versioned schema migrations (`MIGRATIONS`, `migrate`). v1 core tables; v2 durable ledger; v3
 approval snapshots/presentation; v4 reservations and monitor state; v5 reasoning usage; v6
-correlation ids and retention/metrics indexes.
+correlation ids and retention/metrics indexes; v7 vault + action audit; v8 task-scoped
+permission grants.
+
+### `src/vault.ts`
+Encrypted credential store for real-world actions. AES-256-GCM values with a key file outside
+the database (`loadVaultKey`, generated 0600 on first use). `Vault.put`/`remove` are
+operator-only (no MCP write path); `list` returns metadata only; `use` decrypts for
+gateway-side action runners and records the access.
 
 ### `src/backup.ts`
 Encrypted state backup and restore (`exportState`, `restoreState`, `verifyBackup`,
@@ -55,7 +62,8 @@ prompts; `watchdog` and `reconcile` recover missed idle events.
 ### `src/delivery.ts`
 The outbound delivery worker. Claims chunks under a lease, sends text/location/venue through
 the `Chat` interface, applies bounded exponential backoff with jitter, marks ambiguous
-outcomes `unknown`, and records permanent failures. `backoff` is exported for tests.
+outcomes `unknown`, and records permanent failures — surfacing each failed event to the owner
+once as an urgent `system` update. `backoff` is exported for tests.
 
 ### `src/reasoning.ts`
 Maximum-reasoning policy and cost guard. `reserveReasoning` estimates cost and blocks a turn
@@ -74,7 +82,9 @@ Tracks activity/error maps in memory.
 Permission and question prompts. Persists each request and presentation step, sends Telegram
 keyboards, binds taps and text replies to the request/message id, answers OpenCode, and
 reconciles using successful-snapshot watermarks so an outage never expires a real request.
-Nudges unanswered requests.
+Nudges unanswered requests. Permissions offer Once / Task / Deny: "Task" records a
+session-scoped grant (`permission_grants`) and later matching requests are auto-answered once.
+There is no global "always".
 
 ### `src/scheduler.ts`
 Time-based work: reminders, recurring cron jobs (with a minimum interval), monitor scripts
@@ -95,8 +105,9 @@ The fakeable `Chat` interface and its grammY implementation: `sendText`, `sendCh
 `transient`/`permanent`/`ambiguous` for the delivery ledger.
 
 ### `src/telegram/bot.ts`
-grammY bot, owner/private-chat middleware, typed commands (`/tasks`, `/stop`, `/new`, `/model`,
-`/cost`, `/quiet`), callback routing for approvals and model pickers, and text-reply routing.
+grammY bot, owner/private-chat middleware, typed commands (`/tasks`, `/actions`, `/stop`,
+`/new`, `/model`, `/cost`, `/quiet on|off|today|auto`), a minimal published command menu,
+callback routing for approvals, stuck-task buttons and model pickers, and text-reply routing.
 
 ### `src/telegram/format.ts`
 Markdown → Telegram HTML rendering, escaping, chunking and bubble splitting.
@@ -105,7 +116,8 @@ Markdown → Telegram HTML rendering, escaping, chunking and bubble splitting.
 The hq HTTP server: `/mcp` (assistant tools), `/notify` (monitor scripts), `/health`
 (liveness), `/ready` (readiness), `/metrics`. Bearer authentication with constant-time
 comparison, body-size limit, and per-request correlation ids. Also `buildMcpServer` with the
-`hq_*` tools (locations, tasks, reminders, jobs, monitors, provider balance).
+`hq_*` tools (locations, tasks, reminders, jobs, monitors, provider balance, vault listing,
+action audit).
 
 ### `src/provider.ts`
 crowbot balance lookup and formatting for `hq_provider_balance` / `/cost`.
@@ -113,6 +125,15 @@ crowbot balance lookup and formatting for `hq_provider_balance` / `/cost`.
 ### `src/geocoder.ts`
 Provider-neutral geocoder adapter with timeout, rate limit, validation and result
 disambiguation; coordinate/text/URL validators used by the location tool and delivery.
+
+### `src/media.ts`
+Media understanding pipeline. Photos, voice notes, audio and image documents arrive from
+Telegram, are downloaded to a temp file, and become annotated text for the (text-only) model
+via pluggable `OcrEngine`/`SttEngine` interfaces. Defaults are local CLI engines
+(`TesseractOcr`, `WhisperCppStt` + ffmpeg wav conversion) so nothing leaves the server;
+cloud engines slot in behind the same interfaces. Missing engines fall back to a polite
+"I can't read that yet" reply, oversized files are refused at `MEDIA_MAX_MB`, and temp files
+are always deleted.
 
 ### `src/text.ts`
 Formatting and parsing helpers: slugs, truncation, durations, `usd`, `stamp`, `NO_REPLY`
@@ -126,13 +147,16 @@ no model calls.
 
 ### `scripts/`
 `dev-opencode.ts` (local OpenCode launcher), `dev-smoke.sh` / `dev-smoke.ts` (stub-model smoke
-harness), `dev-stub-model.ts` (local OpenAI-compatible stub).
+harness), `dev-stub-model.ts` (local OpenAI-compatible stub), `vault-add.ts` (operator CLI to
+store vault credentials; reads the value from stdin).
 
 ### `deploy/`
 - `deploy.sh` — operator side: audit, setup, or upload a checksummed update.
 - `release.sh` — shared release helpers (verify, build, overlays, activate, recover).
 - `update.sh` — server side: build off to the side, atomic switch, readiness gate, rollback.
-- `setup.sh` — first install: users, immutable release, units, secrets, backup key.
+- `setup.sh` — first install: users, immutable release, units, secrets, backup key, and (opt-in,
+  `MEDIA_ENGINES=1`, asked interactively) local media engines: tesseract + ffmpeg via apt,
+  whisper.cpp binary and model under `/opt/crowstance/bin`, written into the gateway env.
 - `install-units.sh` — render and install systemd units from `deploy/systemd/`.
 - `health-check.sh` — gateway `/ready`, OpenCode health, systemd unit state.
 - `doctor.sh` — release-state and ownership checks.

@@ -110,6 +110,38 @@ export const MIGRATIONS: { version: number; sql: string }[] = [
       CREATE INDEX IF NOT EXISTS delivery_attempts_finished ON delivery_attempts(finished_at);
     `,
   },
+  {
+    // Vault: encrypted credentials the agent may use by handle but never read back.
+    // Audit: outward-facing actions the assistant prepares or takes, with rationale and consent.
+    version: 7,
+    sql: `
+      CREATE TABLE IF NOT EXISTS vault (
+        handle TEXT PRIMARY KEY, service TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'secret',
+        ciphertext BLOB NOT NULL, nonce BLOB NOT NULL, tag BLOB NOT NULL,
+        note TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        last_used_at INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS action_audit (
+        id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL, session_id TEXT,
+        task_slug TEXT, service TEXT, action TEXT NOT NULL, detail TEXT,
+        rationale TEXT, cost_estimate_usd REAL, consent TEXT NOT NULL DEFAULT 'none',
+        consent_ref TEXT, status TEXT NOT NULL DEFAULT 'prepared', correlation_id TEXT
+      );
+      CREATE INDEX IF NOT EXISTS action_audit_created ON action_audit(created_at);
+    `,
+  },
+  {
+    // Task-scoped consent: "allow for this task" remembers a permission pattern for
+    // one session and auto-answers later matching requests. Never global "always".
+    version: 8,
+    sql: `
+      CREATE TABLE IF NOT EXISTS permission_grants (
+        id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, permission TEXT NOT NULL,
+        patterns TEXT NOT NULL, created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS permission_grants_session ON permission_grants(session_id);
+    `,
+  },
 ];
 
 export function migrate(db: Database.Database) {

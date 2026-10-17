@@ -25,6 +25,8 @@ export class Delivery {
   private readonly sleep: (ms: number) => Promise<void>;
   private stopping = false;
   private loopPromise: Promise<void> | undefined;
+  /** Event IDs whose permanent failure was already surfaced to the owner (notify once). */
+  private readonly notifiedFailures = new Set<string>();
 
   constructor(store: Store, chat: Chat, opts: DeliveryOptions = {}) {
     this.store = store;
@@ -99,6 +101,16 @@ export class Delivery {
     if (result.kind === "permanent" || attempts >= this.maxAttempts) {
       this.store.finishChunk(chunk.event_id, chunk.seq, "failed", { failure: result.error.message, outcome: result.kind });
       log.error(`permanent Telegram delivery failure for ${chunk.event_id}/${chunk.seq}: ${result.error.message}`);
+      if (!this.notifiedFailures.has(chunk.event_id)) {
+        this.notifiedFailures.add(chunk.event_id);
+        const preview = chunk.payload.length > 120 ? `${chunk.payload.slice(0, 120)}…` : chunk.payload;
+        this.store.enqueueUpdate(
+          "system",
+          `⚠️ A message to you could not be delivered after ${attempts} attempts and was dropped (${result.error.message}). ` +
+            `Content: "${preview.replace(/\n+/g, " ")}"`,
+          true,
+        );
+      }
     } else {
       const state: DeliveryState = result.kind === "ambiguous" ? "unknown" : "retryable";
       this.store.finishChunk(chunk.event_id, chunk.seq, state, { failure: result.error.message, nextAttemptAt: this.now() + backoff(attempts, this.baseDelayMs, this.maxDelayMs), outcome: result.kind });

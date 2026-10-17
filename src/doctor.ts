@@ -122,6 +122,25 @@ async function main() {
     fail(`OpenCode can't read ${cfg.ASSISTANT_HOME}: ${(err as Error).message}`);
   }
 
+  console.log("Media (OCR/STT)");
+  {
+    const { execFile } = await import("node:child_process");
+    const run = (bin: string, args: string[]) =>
+      new Promise<boolean>((resolve) => {
+        execFile(bin, args, { timeout: 15_000 }, (err) => resolve(!err));
+      });
+    if (cfg.TESSERACT_BIN) {
+      if (await run(cfg.TESSERACT_BIN, ["--version"])) ok(`tesseract works (${cfg.TESSERACT_BIN})`);
+      else fail(`TESSERACT_BIN set but not runnable: ${cfg.TESSERACT_BIN}`);
+    } else warn("TESSERACT_BIN unset — the bot can't read photos");
+    if (cfg.WHISPER_BIN && cfg.WHISPER_MODEL) {
+      const fs = await import("node:fs");
+      if (!fs.existsSync(cfg.WHISPER_MODEL)) fail(`WHISPER_MODEL missing: ${cfg.WHISPER_MODEL}`);
+      else if (await run(cfg.WHISPER_BIN, ["--help"])) ok(`whisper.cpp works (${cfg.WHISPER_BIN}, model ${cfg.WHISPER_MODEL})`);
+      else fail(`WHISPER_BIN set but not runnable: ${cfg.WHISPER_BIN}`);
+    } else warn("WHISPER_BIN/WHISPER_MODEL unset — the bot can't hear voice messages");
+  }
+
   console.log("hq (MCP + notify)");
   const running = await portInUse(cfg.HQ_HOST, cfg.HQ_PORT);
   let temp: Awaited<ReturnType<typeof startHqServer>> | undefined;

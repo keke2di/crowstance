@@ -60,6 +60,27 @@ describe("Approvals", () => {
     expect(chat.edits.at(-1)!.html).toContain("Answered elsewhere");
   });
 
+  it("'allow for this task' auto-answers later matching requests for the same session", async () => {
+    const { oc, chat, approvals } = setup();
+    await approvals.onPermissionAsked(perm, "/p");
+    expect(await approvals.answerPermission("per_1", "task")).toBe("✅ Allowed for this task");
+    expect(oc.permissionReplies).toEqual([{ requestID: "per_1", reply: "once" }]);
+
+    // A later request with the same patterns in the same session is answered without a new prompt.
+    const second = { ...perm, id: "per_2" };
+    await approvals.onPermissionAsked(second, "/p");
+    expect(oc.permissionReplies).toEqual([
+      { requestID: "per_1", reply: "once" },
+      { requestID: "per_2", reply: "once" },
+    ]);
+    expect(chat.html).toHaveLength(1); // no new prompt
+
+    // ...but a different command, or a different session, still asks.
+    await approvals.onPermissionAsked({ ...perm, id: "per_3", patterns: ["rm -rf build"] }, "/p");
+    await approvals.onPermissionAsked({ ...perm, id: "per_4", sessionID: "ses_other" }, "/p");
+    expect(chat.html).toHaveLength(3);
+  });
+
   it("collects answers to multi-part questions before replying", async () => {
     const { oc, chat, approvals } = setup();
     await approvals.onQuestionAsked(question, "/p");

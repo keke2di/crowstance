@@ -26,9 +26,20 @@ const Env = z.object({
   GEOCODER_TIMEOUT_MS: z.coerce.number().int().positive().max(30_000).default(5_000),
   GEOCODER_MIN_INTERVAL_MS: z.coerce.number().int().min(0).max(60_000).default(1_000),
 
+  /** Media understanding: binaries for local OCR/STT. Empty = that media type stays unread. */
+  TESSERACT_BIN: z.string().optional(), // e.g. /usr/bin/tesseract — enables photo OCR
+  TESSERACT_LANG: z.string().optional(),
+  WHISPER_BIN: z.string().optional(), // whisper.cpp CLI (whisper-cli) — enables voice/audio STT
+  WHISPER_MODEL: z.string().optional(), // path to ggml-*.bin, required when WHISPER_BIN is set
+  WHISPER_LANG: z.string().optional(),
+  FFMPEG_BIN: z.string().default("ffmpeg"), // converts voice notes to wav for whisper
+  MEDIA_MAX_MB: z.coerce.number().positive().default(20), // refuse bigger files from Telegram
+
   ASSISTANT_HOME: z.string().min(1),
   PROJECTS_DIR: z.string().min(1),
   DATA_DIR: z.string().default("./data"),
+  /** File holding the 32-byte vault key (generated on first use). Default: <DATA_DIR>/vault.key */
+  VAULT_KEY_FILE: z.string().optional(),
 
   ASSISTANT_AGENT: z.string().default("assistant"),
   WORKER_AGENT: z.string().default("worker"),
@@ -50,6 +61,8 @@ const Env = z.object({
   MAX_WORKERS: z.coerce.number().int().positive().default(3),
   MIN_JOB_INTERVAL_MIN: z.coerce.number().int().positive().default(60),
   STUCK_AFTER_MIN: z.coerce.number().int().positive().default(120),
+  /** If the main session has been busy longer than this, the watchdog re-polls its real status. */
+  BUSY_WATCHDOG_SEC: z.coerce.number().int().positive().default(45),
   MONITOR_TIMEOUT_SEC: z.coerce.number().int().positive().default(120),
   DISK_CHECK_PATH: z.string().default("/"),
   DISK_MIN_FREE_GB: z.coerce.number().min(0).default(5),

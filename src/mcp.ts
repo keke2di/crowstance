@@ -19,6 +19,7 @@ import { crowbotBalance, describeBalance } from "./provider.ts";
 import type { Scheduler } from "./scheduler.ts";
 import { UserError, type Tasks } from "./tasks.ts";
 import { startOfLocalDay, startOfLocalMonth, truncate, usd } from "./text.ts";
+import type { Vault } from "./vault.ts";
 import { configuredGeocoder, validateCoordinates, validateLocationText, validateMapsUrl, MAX_LOCATION_ADDRESS, MAX_LOCATION_NAME, type Geocoder } from "./geocoder.ts";
 
 const log = logger("hq");
@@ -26,7 +27,7 @@ const log = logger("hq");
 export type MappedLocationPayload = { delivery: "location" | "venue"; latitude: number; longitude: number; name: string; address?: string; maps_url?: string; source: string; confidence: string };
 export type DependencyCheck = { ok: boolean; detail?: string };
 export type ReadinessReport = { ready: boolean; checks: Record<string, DependencyCheck> };
-type Deps = { cfg: Config; store: Store; tasks: Tasks; scheduler: Scheduler; onUpdate: () => void; geocoder?: Geocoder; readiness?: () => Promise<ReadinessReport> };
+type Deps = { cfg: Config; store: Store; tasks: Tasks; scheduler: Scheduler; onUpdate: () => void; geocoder?: Geocoder; vault?: Vault; readiness?: () => Promise<ReadinessReport> };
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
 const ok = (text: string): ToolResult => ({ content: [{ type: "text", text }] });
@@ -41,7 +42,7 @@ async function guarded(name: string, fn: () => Promise<string> | string): Promis
   }
 }
 
-export function buildMcpServer({ cfg, store, tasks, scheduler, geocoder }: Deps): McpServer {
+export function buildMcpServer({ cfg, store, tasks, scheduler, geocoder, vault }: Deps): McpServer {
   const server = new McpServer({ name: "hq", version: "0.1.0" });
   const locationGeocoder = geocoder ?? configuredGeocoder(cfg);
 
@@ -95,6 +96,73 @@ export function buildMcpServer({ cfg, store, tasks, scheduler, geocoder }: Deps)
         const spend = `spent by this assistant: ${usd(store.spendSince(startOfLocalDay()))} today, ${usd(store.spendSince(startOfLocalMonth()))} this month (daily budget ${usd(cfg.DAILY_BUDGET_USD)})`;
         if (!cfg.CROWBOT_API_KEY) return `${spend}. The provider balance isn't available (no key configured for the gateway).`;
         return `${describeBalance(await crowbotBalance(cfg.CROWBOT_API_KEY))}; ${spend}`;
+      }),
+  );
+
+  server.registerTool(
+    "vault_list",
+    {
+      description:
+        "List the credentials stored in the vault: handle, service, kind, note and when each was last used. " +
+        "Values are never returned and cannot be read by you — you can only ask an action runner to use a handle. " +
+        "Use this to check what logins/payment methods exist before preparing a real-world action.",
+      inputSchema: {},
+    },
+    () =>
+      guarded("vault_list", () => {
+        if (!vault) return "The vault is not configured on this gateway.";
+        const entries = vault.list();
+        if (!entries.length) return "The vault is empty. Credentials are added by the user, never by you.";
+        return entries
+          .map((e) => `- ${e.handle} (${e.service}, ${e.kind})${e.note ? ` — ${e.note}` : ""}${e.last_used_at ? `; last used ${new Date(e.last_used_at).toISOString()}` : ""}`)
+          .join("\n");
+      }),
+  );
+
+  server.registerTool(
+    "action_record",
+    {
+      description:
+        "Record a real-world action you are preparing or taking on the user's behalf (an audit trail entry: what, why, estimated cost, " +
+        "how the user consented). Always record before acting. Spending money is never silent: consent must reference an explicit user confirmation.",
+      inputSchema: {
+        service: z.string().min(1).max(60).describe("The service this touches, e.g. 'glovo'"),
+        action: z.string().min(3).max(160).describe("Short verb phrase, e.g. 'prepared basket', 'placed order'"),
+        detail: z.string().max(1500).optional().describe("What exactly: basket contents, form values, slot — no secrets"),
+        rationale: z.string().max(500).optional().describe("Why the user wants this"),
+        cost_estimate_usd: z.number().nonnegative().optional(),
+        consent: z.enum(["none", "explicit", "task-scoped"]).describe("How the user consented; 'explicit' requires consent_ref"),
+        consent_ref: z.string().max(120).optional().describe("Reference to the consent (approval request id or Telegram message)"),
+        status: z.enum(["prepared", "confirmed", "cancelled", "completed", "failed"]).optional(),
+        task_slug: z.string().max(80).optional(),
+      },
+    },
+    (a) =>
+      guarded("action_record", () => {
+        if (a.consent === "explicit" && !a.consent_ref) throw new UserError("Explicit consent needs a consent_ref (the approval request id or message).");
+        if (a.status === "completed" && a.consent === "none") throw new UserError("Completing a real-world action without recorded consent is not allowed.");
+        const id = store.auditAction({ ...a, sessionID: undefined });
+        return `Recorded action #${id} (${a.action}${a.service ? ` on ${a.service}` : ""}, consent: ${a.consent}).`;
+      }),
+  );
+
+  server.registerTool(
+    "action_list",
+    {
+      description: "List recently recorded real-world actions (the audit trail). Use this when the user asks what was done on their behalf.",
+      inputSchema: { limit: z.number().int().min(1).max(50).optional() },
+    },
+    ({ limit }) =>
+      guarded("action_list", () => {
+        const rows = store.recentActions(limit ?? 20);
+        if (!rows.length) return "No actions recorded yet.";
+        return rows
+          .map(
+            (r) =>
+              `- #${r.id} ${new Date(r.created_at).toISOString()} [${r.status}] ${r.action}${r.service ? ` (${r.service})` : ""}` +
+              `${r.cost_estimate_usd != null ? ` ~${usd(r.cost_estimate_usd)}` : ""}, consent: ${r.consent}${r.detail ? `\n  ${truncate(r.detail, 200)}` : ""}`,
+          )
+          .join("\n");
       }),
   );
 

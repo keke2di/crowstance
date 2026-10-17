@@ -10,6 +10,8 @@
 #   CROW_CPU_QUOTA, CROW_MEMORY_MAX   override the resource caps, e.g. 200% / 6G
 #   ADMIN_USER        dedicated mode: sudo user that replaces root SSH logins (default: admin)
 #   OPENCODE_VERSION (default 1.18.34), NODE_MAJOR (default 24)
+#   MEDIA_ENGINES=1   install local OCR + speech-to-text (tesseract, ffmpeg, whisper.cpp ~150MB model)
+#                     so the bot can read photos and voice memos; prompted interactively if unset
 #
 # Shared mode changes nothing server-wide: no package upgrades or service restarts, no firewall, SSH,
 # timezone or swap changes, and it brings its own Node.js. The assistant is capped at half the CPU cores
@@ -31,7 +33,7 @@ SRC_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # --- settings: given now > secrets file > previous run > defaults ---------------------------------
 declare -A given=()
-for k in SHARED TZ CROW_HIDE_PATHS CROW_CPU_QUOTA CROW_MEMORY_MAX CROW_FENCE_PUBLIC_PORTS ADMIN_USER OPENCODE_VERSION NODE_MAJOR; do
+for k in SHARED TZ CROW_HIDE_PATHS CROW_CPU_QUOTA CROW_MEMORY_MAX CROW_FENCE_PUBLIC_PORTS ADMIN_USER OPENCODE_VERSION NODE_MAJOR MEDIA_ENGINES; do
   if [ -n "${!k:-}" ]; then given[$k]="${!k}"; fi
 done
 # shellcheck disable=SC1090
@@ -53,9 +55,22 @@ pick_port() { local p="$1"; while ! port_free "$p"; do p=$((p + 1)); done; echo 
 
 if [ "$SHARED" = 1 ]; then echo "Shared mode: nothing server-wide will be changed."; fi
 
+# Media engines: asked once, remembered in setup.env. "1" = install tesseract + ffmpeg + whisper.cpp
+# so photos and voice memos become text for the model; "0" = text-only bot.
+if [ -z "${MEDIA_ENGINES:-}" ]; then
+  if [ -t 0 ]; then
+    read -r -p "Install local OCR + speech-to-text so the bot can read photos and voice memos? (downloads ~150MB model) [Y/n]: " answer </dev/tty
+    case "${answer:-y}" in [Nn]*) MEDIA_ENGINES=0 ;; *) MEDIA_ENGINES=1 ;; esac
+  else
+    MEDIA_ENGINES=1
+  fi
+fi
+echo "Media engines (OCR/STT): $([ "$MEDIA_ENGINES" = 1 ] && echo enabled || echo disabled)"
+
 step "Packages (only what's missing)"
 apt-get update -q
 NEED="git curl ca-certificates jq ripgrep unzip xz-utils build-essential python3 python3-venv python3-pip sqlite3 rsync openssl iptables iproute2 sudo"
+if [ "$MEDIA_ENGINES" = 1 ]; then NEED="$NEED tesseract-ocr ffmpeg"; fi
 missing=""
 for p in $NEED; do dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"; done
 # shellcheck disable=SC2086
@@ -100,6 +115,33 @@ if [ ! -x "$BIN_DIR/gh" ]; then
   curl -fsSL "https://github.com/cli/cli/releases/download/v$GH_VER/gh_${GH_VER}_linux_${GH_ARCH}.tar.gz" | tar -xz -C "$tmp"
   install -m 755 "$tmp/gh_${GH_VER}_linux_${GH_ARCH}/bin/gh" "$BIN_DIR/gh"
   rm -rf "$tmp"
+fi
+
+if [ "$MEDIA_ENGINES" = 1 ]; then
+  step "Local media engines (tesseract OCR via apt; whisper.cpp CLI + model)"
+  # whisper.cpp ships no deb; use the prebuilt release binary (CPU build, x64) and the small
+  # English model. Both live under /opt/crowstance so the gateway unit can reach them.
+  WHISPER_TAG="${WHISPER_TAG:-b5454}"
+  if [ "$ARCH" = "x64" ] && [ ! -x "$BIN_DIR/whisper-cli" ]; then
+    tmp="$(mktemp -d)"
+    curl -fsSL "https://github.com/ggml-org/whisper.cpp/releases/download/$WHISPER_TAG/whisper-bin-x64.zip" -o "$tmp/whisper.zip"
+    unzip -q "$tmp/whisper.zip" -d "$tmp/unpack"
+    bin="$(find "$tmp/unpack" -name 'whisper-cli*' -type f | head -1)"
+    if [ -n "$bin" ]; then
+      install -m 755 "$bin" "$BIN_DIR/whisper-cli"
+      find "$tmp/unpack" \( -name '*.so' -o -name '*.so.*' -o -name '*.dll' \) -exec cp {} "$BIN_DIR/" \;
+    else
+      echo "whisper-cli not found in the release archive; leaving WHISPER_BIN unset"
+    fi
+    rm -rf "$tmp"
+  fi
+  if [ "$ARCH" != "x64" ]; then
+    echo "whisper.cpp prebuilt is x64-only here; on arm64 build it from source or leave WHISPER_BIN unset"
+  fi
+  WHISPER_MODEL_PATH="$BIN_DIR/ggml-base.en.bin"
+  if [ ! -f "$WHISPER_MODEL_PATH" ]; then
+    curl -fsSL "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin" -o "$WHISPER_MODEL_PATH"
+  fi
 fi
 
 step "Users: $AGENT (does the work) and $GW (talks to Telegram)"
@@ -205,6 +247,7 @@ NICE=$NICE
 MEMORY_MAX=$MEMORY_MAX
 SWAP_MAX=$SWAP_MAX
 TASKS_MAX=$TASKS_MAX
+MEDIA_ENGINES=$MEDIA_ENGINES
 EOF
 
 step "Secrets in $ETC"
@@ -259,6 +302,11 @@ MORNING_CHECKIN=08:30
 DAILY_BUDGET_USD=20
 MAX_WORKERS=3
 EOF
+# Media engines installed above; only written when the binaries actually exist.
+if [ -x "$BIN_DIR/whisper-cli" ] && [ -f "$BIN_DIR/ggml-base.en.bin" ]; then
+  printf 'WHISPER_BIN=%s\nWHISPER_MODEL=%s\n' "$BIN_DIR/whisper-cli" "$BIN_DIR/ggml-base.en.bin" >> $GW_ENV
+fi
+if command -v tesseract >/dev/null; then echo "TESSERACT_BIN=$(command -v tesseract)" >> $GW_ENV; fi
 # settings you added by hand survive re-runs if they live in gateway.env.local
 if [ -f $ETC/gateway.env.local ]; then cat $ETC/gateway.env.local >> $GW_ENV; fi
 # systemd reads these as root before starting the services, so no service user needs to read them.

@@ -53,15 +53,18 @@ export class Tasks {
   private readonly store: Store;
   private readonly oc: OpenCode;
   private readonly onUpdate: () => void;
+  /** Optional direct-to-user alert with keep/stop buttons when a task looks stuck. Falls back to an update note. */
+  private readonly onStuck?: (task: TaskRow, idleFor: string) => void;
   private readonly lastTouch = new Map<string, number>();
   private readonly lastError = new Map<string, string>();
   private readonly idleLocks = new Map<string, Promise<void>>();
 
-  constructor(deps: { cfg: Config; store: Store; oc: OpenCode; onUpdate: () => void }) {
+  constructor(deps: { cfg: Config; store: Store; oc: OpenCode; onUpdate: () => void; onStuck?: (task: TaskRow, idleFor: string) => void }) {
     this.cfg = deps.cfg;
     this.store = deps.store;
     this.oc = deps.oc;
     this.onUpdate = deps.onUpdate;
+    this.onStuck = deps.onStuck;
   }
 
   workerModel(override?: string) {
@@ -199,7 +202,7 @@ export class Tasks {
     return t;
   }
 
-  /** One line per task: what /tasks and task_list show. */
+  /** One line per task plus a short detail block for anything running: what /tasks shows. */
   async list(includeFinishedHours = 24): Promise<string> {
     const tasks = this.store.recentTasks(Date.now() - includeFinishedHours * 3_600_000);
     if (tasks.length === 0) return "No tasks right now.";
@@ -210,14 +213,21 @@ export class Tasks {
           this.oc.todo(t.session_id, t.directory).catch(() => [] as Todo[]),
           this.oc.getSession(t.session_id, t.directory).catch(() => undefined),
         ]);
+        const pending = this.store.openApprovals().filter((a) => a.session_id === t.session_id).length;
         const bits = [
           describeState(t, live),
           t.state === "running" || t.state === "waiting" ? `for ${duration(Date.now() - t.created_at)}` : `${ago(t.updated_at)}`,
           progress(todos),
           session ? usd(session.cost ?? 0) : undefined,
           t.state === "running" ? `last activity ${ago(t.last_activity_at)}` : undefined,
+          pending > 0 ? `⚠️ waiting on your approval` : undefined,
         ].filter(Boolean);
-        return `- ${t.slug}: ${t.title} — ${bits.join(", ")}`;
+        let line = `- ${t.slug}: ${t.title} — ${bits.join(", ")}`;
+        if (t.state === "running") {
+          const doing = todos.find((x) => x.status === "in_progress")?.content;
+          if (doing) line += `\n  working on: ${truncate(doing, 120)}`;
+        }
+        return line;
       }),
     );
     return lines.join("\n");
@@ -343,7 +353,11 @@ export class Tasks {
       if (now - t.last_activity_at < this.cfg.STUCK_AFTER_MIN * 60_000) continue;
       this.store.updateTask(t.slug, { stuck_notified: 1 });
       log.warn("task looks stuck", { slug: t.slug, idleMs: now - t.last_activity_at });
-      this.store.enqueueUpdate("task", `Task ${t.slug} ("${t.title}") has shown no activity for ${duration(now - t.last_activity_at)}. It may be stuck.`);
+      if (this.onStuck) {
+        this.onStuck(t, duration(now - t.last_activity_at));
+      } else {
+        this.store.enqueueUpdate("task", `Task ${t.slug} ("${t.title}") has shown no activity for ${duration(now - t.last_activity_at)}. It may be stuck.`);
+      }
       this.onUpdate();
     }
   }
