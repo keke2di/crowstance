@@ -2,7 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import { loadConfig, type Config } from "../src/config.ts";
 import { Store } from "../src/db.ts";
-import type { MessageWithParts, OpenCode, PermissionRequest, QuestionRequest, SessionStatus, Todo } from "../src/opencode.ts";
+import type { FormRequest, Message, OpenCode, PermissionRequest, Session } from "../src/opencode.ts";
 import type { Chat, SendOpts, SendResult } from "../src/telegram/chat.ts";
 
 export function testConfig(overrides: Record<string, string> = {}): Config {
@@ -24,47 +24,66 @@ export function memoryStore() {
 }
 
 let clock = 1_000;
-export function assistantMessage(sessionID: string, text: string, extra: { error?: unknown; completed?: boolean } = {}): MessageWithParts {
+export function assistantMessage(sessionID: string, text: string, extra: { error?: unknown; completed?: boolean } = {}): Message {
   const created = Date.now() + clock++;
   const id = `msg_${created}`;
   return {
-    info: {
-      id,
-      sessionID,
-      role: "assistant",
-      time: { created, ...(extra.completed === false ? {} : { completed: created + 1 }) },
-      ...(extra.error ? { error: extra.error } : {}),
-      parentID: "msg_parent",
-      modelID: "m",
-      providerID: "p",
-      mode: "assistant",
-      agent: "assistant",
-      path: { cwd: "/", root: "/" },
-      cost: 0.01,
-      tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
-    },
-    parts: text ? [{ id: `prt_${created}`, sessionID, messageID: id, type: "text", text }] : [],
-  } as unknown as MessageWithParts;
+    id,
+    sessionID,
+    type: "assistant",
+    agent: "assistant",
+    model: { id: "m", providerID: "p" },
+    time: { created, ...(extra.completed === false ? {} : { completed: created + 1 }) },
+    content: text ? [{ type: "text", text }] : [],
+    ...(extra.error ? { error: extra.error as never } : {}),
+    cost: 0.01,
+    tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+  } as Message;
+}
+
+/** v2 permission request, with the v1 field names accepted for convenience in tests. */
+export function permRequest(p: { id?: string; sessionID?: string; action?: string; permission?: string; resources?: string[]; patterns?: string[]; metadata?: Record<string, unknown> }): PermissionRequest {
+  return {
+    id: p.id ?? "perm_1",
+    sessionID: p.sessionID ?? "ses_1",
+    action: p.action ?? p.permission ?? "bash",
+    resources: p.resources ?? p.patterns ?? [],
+    metadata: p.metadata ?? {},
+  };
+}
+
+/** v2 form (the question replacement) built from v1-style question fields. */
+export function formRequest(p: { id?: string; sessionID?: string; questions?: { question: string; options?: { label: string; value?: string }[]; multiple?: boolean; custom?: boolean }[] }): FormRequest {
+  return {
+    id: p.id ?? "form_1",
+    sessionID: p.sessionID ?? "ses_1",
+    fields: (p.questions ?? []).map((q, i) => ({
+      key: `q${i}`,
+      title: q.question,
+      type: q.options ? "multiselect" : "string",
+      options: q.options?.map((o) => ({ value: o.value ?? o.label, label: o.label })),
+      custom: q.custom,
+    })),
+  };
 }
 
 type Prompt = { sessionID: string; directory: string; text: string; agent?: string; model?: unknown; variant?: string; noReply?: boolean };
 
 export class FakeOpenCode {
-  sessions = new Map<string, { id: string; directory: string; title: string; cost: number; summary?: { files: number; additions: number; deletions: number } }>();
+  sessions = new Map<string, Session & { directory: string; title: string; cost: number }>();
   prompts: Prompt[] = [];
-  msgs = new Map<string, MessageWithParts[]>();
-  statusMap: Record<string, SessionStatus> = {};
-  todos = new Map<string, Todo[]>();
+  msgs = new Map<string, Message[]>();
+  statusMap: Record<string, { type: "busy" | "idle" }> = {};
   aborted: string[] = [];
   permissionReplies: { requestID: string; reply: string }[] = [];
-  questionReplies: { requestID: string; answers: string[][] }[] = [];
+  formReplies: { formID: string; answer: Record<string, unknown> }[] = [];
   rejected: string[] = [];
   pendingPerms: PermissionRequest[] = [];
-  pendingQs: QuestionRequest[] = [];
+  pendingFs: FormRequest[] = [];
   failPermissionList = false;
-  failQuestionList = false;
+  failFormList = false;
   failPermissionReply = false;
-  failQuestionReply = false;
+  failFormReply = false;
   repos: string[] = [];
   failPrompts = false;
   createSessionDelay = 0;
@@ -84,13 +103,13 @@ export class FakeOpenCode {
   }
   async agents() {
     return [
-      { name: "assistant", mode: "primary", model: { providerID: "crowbot", modelID: "deepseek-v4.1-flash" } },
-      { name: "worker", mode: "primary", model: { providerID: "crowbot", modelID: "gpt-6-astra" } },
+      { id: "assistant", name: "assistant", mode: "primary", hidden: false, model: { providerID: "crowbot", id: "deepseek-v4.1-flash" } },
+      { id: "worker", name: "worker", mode: "primary", hidden: false, model: { providerID: "crowbot", id: "gpt-6-astra" } },
     ];
   }
   async createSession(p: { directory: string; title: string }) {
     if (this.createSessionDelay) await new Promise((resolve) => setTimeout(resolve, this.createSessionDelay));
-    const s = { id: `ses_${this.n++}`, directory: p.directory, title: p.title, cost: 0 };
+    const s = { id: `ses_${this.n++}`, directory: p.directory, title: p.title, cost: 0, projectID: "p", tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, time: { created: Date.now(), updated: Date.now() }, location: { directory: p.directory } };
     this.sessions.set(s.id, s);
     return s;
   }
@@ -103,9 +122,6 @@ export class FakeOpenCode {
   }
   async statuses() {
     return this.statusMap;
-  }
-  async todo(sessionID: string) {
-    return this.todos.get(sessionID) ?? [];
   }
   async abort(sessionID: string) {
     if (this.abortError) throw this.abortError;
@@ -125,26 +141,23 @@ export class FakeOpenCode {
     this.killed.push(ptyID);
   }
   async listPtys() {
-    return this.spawned.map((p) => ({ ...p, title: p.command, status: "exited" as const, pid: 1, exitCode: 0 }));
+    return this.spawned.map((p) => ({ id: p.id, title: p.command, command: p.command, args: p.args, cwd: p.cwd, status: "exited" as const, pid: 1, exitCode: 0 }));
   }
-  async replyPermission(requestID: string, _dir: string, reply: string) {
+  async replyPermission(sessionID: string, requestID: string, reply: string) {
     if (this.failPermissionReply) throw new Error("OpenCode unavailable");
     this.permissionReplies.push({ requestID, reply });
   }
-  async replyQuestion(requestID: string, _dir: string, answers: string[][]) {
-    if (this.failQuestionReply) throw new Error("OpenCode unavailable");
-    this.questionReplies.push({ requestID, answers });
-  }
-  async rejectQuestion(requestID: string) {
-    this.rejected.push(requestID);
+  async replyForm(sessionID: string, formID: string, answer: Record<string, unknown>) {
+    if (this.failFormReply) throw new Error("OpenCode unavailable");
+    this.formReplies.push({ formID, answer });
   }
   async pendingPermissions() {
     if (this.failPermissionList) throw new Error("OpenCode unavailable");
     return this.pendingPerms;
   }
-  async pendingQuestions() {
-    if (this.failQuestionList) throw new Error("OpenCode unavailable");
-    return this.pendingQs;
+  async pendingForms() {
+    if (this.failFormList) throw new Error("OpenCode unavailable");
+    return this.pendingFs;
   }
 
   reply(sessionID: string, text: string, extra?: { error?: unknown; completed?: boolean }) {

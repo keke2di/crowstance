@@ -1,20 +1,26 @@
 import { describe, expect, it } from "vitest";
 import { isClearlyBigRequest, reserveReasoning } from "../src/reasoning.ts";
-import { OpenCode, validateReasoningEffort } from "../src/opencode.ts";
+import { OpenCode } from "../src/opencode.ts";
 import { messageText } from "../src/opencode.ts";
 import { memoryStore, testConfig } from "./fakes.ts";
 
 describe("M5 reasoning contract", () => {
-  it("pins the SDK/server 1.18.34 prompt_async body shape", async () => {
-    const requests: unknown[] = [];
-    const oc = new OpenCode({ url: "http://127.0.0.1:1", username: "test" });
-    (oc.client.session as unknown as { promptAsync: (p: unknown) => Promise<void> }).promptAsync = async (p) => { requests.push(p); };
-    await oc.prompt({ sessionID: "ses", directory: "/project", agent: "assistant", parts: [{ type: "text", text: "hello" }], variant: "max" });
-    expect(requests).toEqual([{ sessionID: "ses", directory: "/project", agent: "assistant", parts: [{ type: "text", text: "hello" }], variant: "max" }]);
-  });
-
-  it("fails clearly for an unsupported variant", () => {
-    expect(() => validateReasoningEffort("high")).toThrow(/Unsupported OpenCode reasoning variant/);
+  it("sends prompts to the v2 prompt endpoint", async () => {
+    const seen: { url: string; body: unknown }[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: unknown, init?: { body?: string }) => {
+      seen.push({ url: String(url), body: init?.body ? JSON.parse(init.body) : undefined });
+      return new Response(JSON.stringify({ data: { id: "msg_1", sessionID: "ses", type: "user" } }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    try {
+      const oc = new OpenCode({ url: "http://127.0.0.1:1", username: "test" });
+      await oc.prompt({ sessionID: "ses", directory: "/project", parts: [{ type: "text", text: "hello" }] });
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.url).toBe("http://127.0.0.1:1/api/session/ses/prompt?directory=%2Fproject");
+      expect(seen[0]!.body).toEqual({ text: "hello" });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 
   it("hands off only clearly big build work; chat, questions and reminders stay with the assistant", () => {
@@ -41,7 +47,7 @@ describe("M5 reasoning contract", () => {
     const cfg = testConfig({ REASONING_DAILY_BUDGET_USD: "1" });
     reserveReasoning(store, cfg, "r1", "s1", "chat", "x".repeat(1000));
     expect(store.reasoningSpendSince(0)).toBeGreaterThan(0);
-    expect(store.reasoningUsageSince(0)[0]).toMatchObject({ scope: "chat", variant: "max" });
+    expect(store.reasoningUsageSince(0)[0]).toMatchObject({ scope: "chat", variant: "default" });
   });
 
   it("blocks new work at the configured daily reasoning threshold", () => {
@@ -51,10 +57,19 @@ describe("M5 reasoning contract", () => {
     expect(() => reserveReasoning(store, cfg, "worker", "worker-session", "worker", "x".repeat(100_000))).toThrow(/budget would be exceeded/);
   });
 
-  it("does not expose reasoning parts in delivered text", () => {
-    expect(messageText([
-      { type: "reasoning", text: "private trace" } as never,
-      { type: "text", text: "public answer" } as never,
-    ])).toBe("public answer");
+  it("does not expose reasoning content in delivered text", () => {
+    expect(
+      messageText({
+        id: "m1",
+        type: "assistant",
+        agent: "assistant",
+        model: { id: "m", providerID: "p" },
+        time: { created: 1, completed: 2 },
+        content: [
+          { type: "reasoning", text: "private trace" },
+          { type: "text", text: "public answer" },
+        ],
+      }),
+    ).toBe("public answer");
   });
 });

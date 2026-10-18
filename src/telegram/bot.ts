@@ -220,10 +220,9 @@ function modelSummary(d: BotDeps) {
 }
 
 async function modelChoices(d: BotDeps): Promise<string[]> {
-  const { providers, default: defaults } = await d.oc.providers(d.cfg.ASSISTANT_HOME);
-  const preferred = new Set(Object.entries(defaults).map(([p, m]) => `${p}/${m}`));
-  const all = providers.flatMap((p) => Object.values(p.models).map((m) => `${p.id}/${m.id}`));
-  return [...all.filter((m) => preferred.has(m)), ...all.filter((m) => !preferred.has(m)).sort()];
+  const { choices, defaults } = await d.oc.modelChoices(d.cfg.ASSISTANT_HOME);
+  const preferred = new Set(defaults);
+  return [...choices.filter((m) => preferred.has(m)), ...choices.filter((m) => !preferred.has(m)).sort()];
 }
 
 async function handleCallback(ctx: Context, d: BotDeps, kind: string, rest: string[]): Promise<string | undefined> {
@@ -231,9 +230,9 @@ async function handleCallback(ctx: Context, d: BotDeps, kind: string, rest: stri
     case "p":
       return d.approvals.answerPermission(rest[0]!, rest[1] as "once" | "reject" | "task", ctx.callbackQuery?.message?.message_id);
     case "q":
-      return d.approvals.tapOption(rest[0]!, Number(rest[1]), Number(rest[2]), ctx.callbackQuery?.message?.message_id);
+      return d.approvals.tapOption(rest[0]!, rest[1]!, Number(rest[2]), ctx.callbackQuery?.message?.message_id);
     case "qd":
-      return d.approvals.submitMultiple(rest[0]!, Number(rest[1]), ctx.callbackQuery?.message?.message_id);
+      return d.approvals.submitMultiple(rest[0]!, rest[1]!, ctx.callbackQuery?.message?.message_id);
     case "qx":
       return d.approvals.dismissQuestion(rest[0]!, ctx.callbackQuery?.message?.message_id);
     case "st": {

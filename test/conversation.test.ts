@@ -303,15 +303,15 @@ describe("Conversation delivery edge cases", () => {
     oc.prompt = original;
   });
 
-  it("preserves maximum reasoning across a restart", async () => {
+  it("keeps its session across a restart", async () => {
     const { cfg, store, oc, chat } = setup();
     const first = new Conversation({ cfg, store, oc: oc.asOpenCode(), chat, isQuiet: () => false });
     first.onUserMessage({ text: "hello", at: new Date() });
     await tick(40);
-    expect(oc.prompts[0]!.variant).toBe("max");
+    expect(oc.prompts).toHaveLength(1);
     first.shutdown();
     const second = new Conversation({ cfg, store, oc: oc.asOpenCode(), chat: new FakeChat(), isQuiet: () => false });
-    expect(store.turn(1)?.reasoning_variant).toBe("max");
+    expect(store.turn(1)?.session_id).toBe(oc.prompts[0]!.sessionID);
     second.shutdown();
   });
 });

@@ -1,6 +1,6 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { describeState, formatTodos, isInside, progress, Tasks, UserError } from "../src/tasks.ts";
+import { describeState, isInside, Tasks, UserError } from "../src/tasks.ts";
 import { FakeOpenCode, memoryStore, testConfig } from "./fakes.ts";
 
 function setup(env: Record<string, string> = {}) {
@@ -11,22 +11,6 @@ function setup(env: Record<string, string> = {}) {
   const tasks = new Tasks({ cfg, store, oc: oc.asOpenCode(), onUpdate: () => updates++ });
   return { cfg, store, oc, tasks, updates: () => updates };
 }
-
-describe("todo helpers", () => {
-  const todos = [
-    { content: "scrape site A", status: "completed", priority: "high" },
-    { content: "scrape site B", status: "in_progress", priority: "high" },
-    { content: "write tests", status: "pending", priority: "medium" },
-    { content: "old idea", status: "cancelled", priority: "low" },
-  ];
-  it("summarises progress, ignoring cancelled items", () => {
-    expect(progress(todos)).toBe("1/3 steps done");
-    expect(progress([])).toBeUndefined();
-  });
-  it("renders a readable checklist", () => {
-    expect(formatTodos(todos)).toBe("  [x] scrape site A\n  [>] scrape site B\n  [ ] write tests\n  [-] old idea");
-  });
-});
 
 describe("paths", () => {
   it("only accepts projects inside the projects dir", () => {
@@ -97,23 +81,15 @@ describe("Tasks lifecycle", () => {
     expect(store.pendingUpdates().at(-1)!.text).toContain("overloaded");
   });
 
-  it("describes status from todos, cost and the latest words", async () => {
+  it("describes status from cost and the latest words", async () => {
     const { oc, tasks } = setup();
     const t = await tasks.start({ title: "Scraper", brief: "Scrape the three listed shops for prices" });
     oc.statusMap[t.session_id] = { type: "busy" };
-    oc.todos.set(t.session_id, [
-      { content: "shop A", status: "completed", priority: "high" },
-      { content: "shop B", status: "in_progress", priority: "high" },
-    ]);
     oc.sessions.get(t.session_id)!.cost = 0.82;
-    oc.sessions.get(t.session_id)!.summary = { files: 4, additions: 120, deletions: 3 };
     oc.reply(t.session_id, "Shop B uses a JSON API, switching to that.");
 
     const text = await tasks.describe("scraper");
     expect(text).toContain("running (working right now)");
-    expect(text).toContain("1/2 steps done");
-    expect(text).toContain("[>] shop B");
-    expect(text).toContain("Files changed: 4 (+120 −3)");
     expect(text).toContain("$0.82");
     expect(text).toContain("JSON API");
   });
@@ -121,7 +97,7 @@ describe("Tasks lifecycle", () => {
   it("phrases task states", () => {
     const { store } = setup();
     const row = { ...store.insertTask({ slug: "x", title: "X", brief: "b", directory: "/p/x", session_id: "ses_x", state: "running", model: null, job: null, created_at: Date.now() }) };
-    expect(describeState(row, { type: "retry", attempt: 1, message: "rate limited", next: 0 })).toMatch(/retrying.*rate limited/);
+    expect(describeState(row, { type: "busy" })).toBe("running (working right now)");
     expect(describeState({ ...row, state: "finished", outcome: "blocked" }, undefined)).toBe("finished (blocked)");
   });
 

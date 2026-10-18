@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "crowbot/gpt-6-astra",
+  "model": "crowbot/gpt-6.1-sol",
   "small_model": "crowbot/deepseek-v4.1-flash",
   "share": "disabled",
   "autoupdate": false,
@@ -17,7 +17,7 @@
       },
       "models": {
         "deepseek-v4.1-flash": {"name":"DeepSeek V4.1 Flash","limit":{"context":1048576,"output":128000},"cost":{"input":0.045,"output":0.18,"cache_read":0.0009},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
-        "gpt-6-astra": {"name":"GPT 6 Astra","limit":{"context":1048576,"output":272000},"cost":{"input":0.3,"output":1.5,"cache_read":0.03},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
+        "gpt-6.1-sol": {"name":"GPT 6.1 Sol","limit":{"context":1048576,"output":128000},"cost":{"input":0.18,"output":0.9,"cache_read":0.009},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
         "kimi-k3": {"name":"Kimi K3","limit":{"context":1048576,"output":1048576},"cost":{"input":0.27,"output":1.35,"cache_read":0.027},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
         "crow-2": {"name":"GLM 5.3 [UNCENSORED]","limit":{"context":1000000,"output":32768},"cost":{"input":5,"output":5,"cache_read":0.5},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false}
       }
@@ -45,15 +45,13 @@
       "tools": {
         "hq_*": true
       },
-      "model": "crowbot/deepseek-v4.1-flash",
-      "variant": "max"
+      "model": "crowbot/deepseek-v4.1-flash"
     },
     "worker": {
       "description": "Autonomous background worker that owns one task end to end",
       "mode": "primary",
       "prompt": "{file:./prompts/worker.md}",
-      "model": "crowbot/deepseek-v4.1-flash",
-      "variant": "max"
+      "model": "crowbot/deepseek-v4.1-flash"
     }
   },
   "permission": {

@@ -1,9 +1,8 @@
 import type { Config } from "./config.ts";
 import { startOfLocalDay } from "./text.ts";
 import type { Store } from "./db.ts";
-import { validateReasoningEffort, type ReasoningEffort } from "./opencode.ts";
 
-export function reasoningVariant(cfg: Config): ReasoningEffort { return validateReasoningEffort(cfg.REASONING_VARIANT); }
+export function reasoningVariant(_cfg: Config): string { return "default"; }
 
 export function estimatedReasoningCost(cfg: Config, text: string): number {
   const output = Math.min(cfg.REASONING_MAX_OUTPUT_TOKENS, Math.max(256, Math.ceil(text.length / 3) * 4));

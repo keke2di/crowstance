@@ -65,7 +65,7 @@ async function main() {
   try {
     const h = await oc.health();
     ok(`server ${h.version} at ${cfg.OPENCODE_URL}`);
-    if (!h.version.startsWith("1.18.")) warn(`this gateway was built against OpenCode 1.18.x; you're running ${h.version}`);
+    if (!h.version.startsWith("2.")) warn(`this gateway was built against OpenCode 2.x; you're running ${h.version}`);
   } catch (err) {
     fail(`not reachable at ${cfg.OPENCODE_URL}: ${(err as Error).message}`);
     process.exit(1);
@@ -79,13 +79,13 @@ async function main() {
       [cfg.ASSISTANT_AGENT, cfg.CHAT_MODEL],
       [cfg.WORKER_AGENT, cfg.WORKER_MODEL],
     ] as const) {
-      const agent = agents.find((a) => a.name === name);
+      const agent = agents.find((a) => a.id === name || a.name === name);
       if (!agent) {
         fail(`agent "${name}" missing — is OpenCode started with OPENCODE_CONFIG pointing at opencode/opencode.json?`);
         continue;
       }
       ok(`agent "${name}" is defined`);
-      const ref = override ?? (agent.model ? `${agent.model.providerID}/${agent.model.modelID}` : undefined);
+      const ref = override ?? (agent.model ? `${agent.model.providerID}/${agent.model.id}` : undefined);
       if (ref) inUse.set(ref, [inUse.get(ref), name].filter(Boolean).join(" + "));
     }
   } catch (err) {
@@ -93,17 +93,14 @@ async function main() {
   }
 
   try {
-    const { providers } = await oc.providers(cfg.ASSISTANT_HOME);
+    const { providers, choices } = await oc.modelChoices(cfg.ASSISTANT_HOME);
     ok(`providers available: ${providers.map((p) => p.id).join(", ") || "none"}`);
     for (const [ref, users] of inUse) {
-      const { providerID, modelID } = parseModelRef(ref);
-      const p = providers.find((x) => x.id === providerID);
-      if (!p) fail(`${ref} (${users}): provider "${providerID}" isn't available — is its API key set?`);
-      else if (!p.models[modelID]) fail(`${ref} (${users}): no such model in "${providerID}"`);
+      if (!choices.includes(ref)) fail(`${ref} (${users}): no such model — is its provider's API key set?`);
       else ok(`${users} → ${ref}`);
     }
   } catch (err) {
-    fail(`could not list providers: ${(err as Error).message}`);
+    fail(`could not list models: ${(err as Error).message}`);
   }
 
   if (cfg.CROWBOT_API_KEY) {
@@ -115,7 +112,7 @@ async function main() {
   } else warn("CROWBOT_API_KEY isn't set for the gateway, so /cost can't show the balance");
 
   try {
-    const entries = (await oc.listDir(cfg.ASSISTANT_HOME)).map((e) => e.name);
+    const entries = (await oc.listDir(cfg.ASSISTANT_HOME)).map((e) => e.name ?? e.path.split(/[\\/]/).pop());
     if (entries.includes("AGENTS.md") && entries.includes("memory")) ok(`assistant home looks right (${entries.length} entries)`);
     else warn(`assistant home ${cfg.ASSISTANT_HOME} has no AGENTS.md/memory — seed it from home/`);
   } catch (err) {

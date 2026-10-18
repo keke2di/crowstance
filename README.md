@@ -4,7 +4,7 @@ A personal AI assistant you text on Telegram. It lives on your VPS, works around
 [OpenCode](https://opencode.ai) with your own model credentials.
 
 ```
-You (Telegram) ──► gateway (this repo, Node 24) ──► opencode serve (1.18.x) ──► crowbot / any provider
+You (Telegram) ──► gateway (this repo, Node 24) ──► opencode serve (2.x) ──► crowbot / any provider
                      │  allowlist, debounce, typing, buttons        ├─ main session  (agent "assistant", ~/assistant)
                      │  tasks, reminders, jobs, monitors (SQLite)   └─ worker sessions (agent "worker", ~/projects/<task>)
                      └─ 127.0.0.1:7801  /mcp (hq_* tools) · /notify (monitor scripts)
@@ -80,7 +80,7 @@ deploy/deploy.sh root@<ip> --setup --shared   # a server that also runs other th
 
 Both modes:
 
-- install a private Node 24, OpenCode 1.18.34 and gh under `/opt/crowstance`; the system's own Node is never touched
+- install a private Node 24, OpenCode 2.0.32 and gh under `/opt/crowstance`; the system's own Node is never touched
 - install code as an immutable release under `/opt/crowstance/releases` and point `/opt/crowstance/app` at it atomically;
   the live tree is never edited in place
 - create three users: **`crow-agent`** runs OpenCode and does the work, with no sudo; **`crow-gateway`** talks to Telegram

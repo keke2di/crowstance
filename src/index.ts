@@ -155,51 +155,71 @@ async function main() {
     await approvals.reconcile([cfg.ASSISTANT_HOME, ...tasks.directories()]);
   };
 
-  const dispatch = async ({ directory, payload: ev }: GlobalEvent) => {
+  const dispatch = async (ev: GlobalEvent) => {
+    const directory = ev.location?.directory ?? cfg.ASSISTANT_HOME;
+    const d = ev.data as Record<string, unknown>;
+    const sessionID = typeof d.sessionID === "string" ? d.sessionID : undefined;
     switch (ev.type) {
       case "server.connected":
         void reconcile().catch((err) => log.error("reconcile failed", err));
         return;
-      case "session.status": {
-        const { sessionID, status } = ev.properties;
-        if (sessionID === conversation.sessionID) {
-          if (status.type !== "idle") conversation.onMainBusy();
-        } else if (status.type === "busy") tasks.onBusy(sessionID);
+      case "session.execution.started": {
+        if (!sessionID) return;
+        if (sessionID === conversation.sessionID) conversation.onMainBusy();
+        else tasks.onBusy(sessionID);
         return;
       }
-      case "session.idle": {
-        const { sessionID } = ev.properties;
+      case "session.execution.succeeded": {
+        if (!sessionID) return;
         if (sessionID === conversation.sessionID) void conversation.onMainIdle();
         else if (tasks.isWorker(sessionID)) await tasks.onIdle(sessionID);
         return;
       }
-      case "session.error":
-        if (ev.properties.sessionID && tasks.isWorker(ev.properties.sessionID)) tasks.onError(ev.properties.sessionID, ev.properties.error);
-        return;
-      case "permission.asked":
-        await approvals.onPermissionAsked(ev.properties, directory ?? cfg.ASSISTANT_HOME);
-        return;
-      case "question.asked":
-        await approvals.onQuestionAsked(ev.properties, directory ?? cfg.ASSISTANT_HOME);
-        return;
-      case "permission.replied":
-      case "question.replied":
-      case "question.rejected":
-        await approvals.onReplied(ev.properties.requestID);
-        return;
-      case "message.updated": {
-        const info = ev.properties.info;
-        if (info.role === "assistant" && info.time.completed) {
-          store.recordSpend(info.id, info.sessionID, info.cost, info.time.completed);
-          const tokens = info.tokens;
-          if (tokens) store.recordReasoningUsage(`session-${info.sessionID}`, tokens.input, tokens.output, tokens.reasoning, info.cost, info.time.completed);
-        }
-        tasks.onActivity(ev.properties.sessionID);
+      case "session.execution.interrupted": {
+        // An interrupt is deliberate (stop button); let the idle handler close the turn out.
+        if (!sessionID) return;
+        if (sessionID === conversation.sessionID) void conversation.onMainIdle();
+        else if (tasks.isWorker(sessionID)) await tasks.onIdle(sessionID);
         return;
       }
-      case "message.part.updated":
-      case "todo.updated":
-        tasks.onActivity(ev.properties.sessionID);
+      case "session.execution.failed": {
+        if (!sessionID) return;
+        tasks.onError(sessionID, d.error);
+        if (sessionID === conversation.sessionID) void conversation.onMainIdle();
+        else if (tasks.isWorker(sessionID)) await tasks.onIdle(sessionID);
+        return;
+      }
+      case "session.usage.updated": {
+        if (!sessionID) return;
+        const tokens = d.tokens as { input: number; output: number; reasoning: number; cache: { read: number; write: number } } | undefined;
+        const cost = typeof d.cost === "number" ? d.cost : 0;
+        const at = typeof ev.created === "number" ? ev.created : Date.now();
+        store.recordSpend(`${sessionID}:${at}`, sessionID, cost, at);
+        if (tokens) store.recordReasoningUsage(`session-${sessionID}`, tokens.input, tokens.output, tokens.reasoning, cost, at);
+        tasks.onActivity(sessionID);
+        return;
+      }
+      case "permission.requested":
+        await approvals.onPermissionAsked(d as unknown as Parameters<Approvals["onPermissionAsked"]>[0], directory);
+        return;
+      case "form.requested":
+        await approvals.onFormRequested(d as unknown as Parameters<Approvals["onFormRequested"]>[0], directory);
+        return;
+      case "permission.replied":
+      case "form.replied":
+      case "form.rejected":
+        if (typeof d.requestID === "string") await approvals.onReplied(d.requestID);
+        else if (typeof d.formID === "string") await approvals.onReplied(d.formID);
+        return;
+      case "session.step.ended":
+      case "session.text.delta":
+      case "session.reasoning.delta":
+      case "session.tool.called":
+      case "session.tool.success":
+      case "session.tool.failed":
+      case "session.inbox.enqueued":
+      case "session.inbox.delivered":
+        if (sessionID) tasks.onActivity(sessionID);
         return;
     }
   };
@@ -210,7 +230,7 @@ async function main() {
       try {
         await dispatch(ev);
       } catch (err) {
-        log.error(`handling ${ev.payload.type} failed`, err);
+        log.error(`handling ${ev.type} failed`, err);
       }
     }
   })();

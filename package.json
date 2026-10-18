@@ -20,7 +20,6 @@
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",
     "@modelcontextprotocol/sdk": "^1.32.1",
-    "@opencode-ai/sdk": "1.18.34",
     "better-sqlite3": "^13.0.3",
     "croner": "^10.0.1",
     "eventsource-parser": "^4.1.1",

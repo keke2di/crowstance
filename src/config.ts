@@ -45,7 +45,6 @@ const Env = z.object({
   WORKER_AGENT: z.string().default("worker"),
   CHAT_MODEL: modelRef.optional(),
   WORKER_MODEL: modelRef.optional(),
-  REASONING_VARIANT: z.literal("max").default("max"),
   REASONING_DAILY_BUDGET_USD: z.coerce.number().positive().default(5),
   REASONING_RESERVE_USD: z.coerce.number().nonnegative().default(0.25),
   REASONING_MAX_DURATION_SEC: z.coerce.number().int().positive().default(900),

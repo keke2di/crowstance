@@ -9,7 +9,7 @@
 #   CROW_HIDE_PATHS   extra paths the agent must never see, e.g. "/var/www /srv/myapp"
 #   CROW_CPU_QUOTA, CROW_MEMORY_MAX   override the resource caps, e.g. 200% / 6G
 #   ADMIN_USER        dedicated mode: sudo user that replaces root SSH logins (default: admin)
-#   OPENCODE_VERSION (default 1.18.34), NODE_MAJOR (default 24)
+#   OPENCODE_VERSION (default 2.0.32), NODE_MAJOR (default 24)
 #   MEDIA_ENGINES=1   install local OCR + speech-to-text (tesseract, ffmpeg, whisper.cpp ~150MB model)
 #                     so the bot can read photos and voice memos; prompted interactively if unset
 #
@@ -43,7 +43,7 @@ if [ -f "$SECRETS_FILE" ]; then set -a; . "$SECRETS_FILE"; set +a; fi
 for k in "${!given[@]}"; do printf -v "$k" '%s' "${given[$k]}"; done
 SHARED="${SHARED:-0}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-OPENCODE_VERSION="${OPENCODE_VERSION:-1.18.34}"
+OPENCODE_VERSION="${OPENCODE_VERSION:-2.0.32}"
 NODE_MAJOR="${NODE_MAJOR:-24}"
 
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l
@@ -106,7 +106,7 @@ if [ "$("$NODE_DIR/bin/node" --version 2>/dev/null || true)" != "$(cut -d- -f2 <
 fi
 export PATH="$BIN_DIR:$NODE_DIR/bin:$PATH"
 if [ "$(opencode --version 2>/dev/null || true)" != "$OPENCODE_VERSION" ]; then
-  npm install -g --no-fund --no-audit "opencode-ai@$OPENCODE_VERSION"
+  npm install -g --no-fund --no-audit "@opencode/cli@$OPENCODE_VERSION"
 fi
 mkdir -p "$BIN_DIR"
 if [ ! -x "$BIN_DIR/gh" ]; then

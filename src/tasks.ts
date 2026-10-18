@@ -9,10 +9,9 @@ import type { Config } from "./config.ts";
 import { parseModelRef } from "./config.ts";
 import { KEY_DISK_LOW, type Store, type TaskRow, type TaskState } from "./db.ts";
 import { logger } from "./log.ts";
-import { errorText, isAssistant, messageText, type OpenCode, type SessionStatus, type Todo } from "./opencode.ts";
+import { errorText, isAssistant, messageText, type OpenCode } from "./opencode.ts";
 import { ago, duration, parseOutcome, slugify, stamp, startOfLocalDay, tail, truncate, usd } from "./text.ts";
 import { reserveReasoning } from "./reasoning.ts";
-import { validateReasoningEffort } from "./opencode.ts";
 
 const log = logger("tasks");
 
@@ -26,22 +25,12 @@ export function isInside(child: string, parent: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
-const TODO_MARK: Record<string, string> = { completed: "[x]", in_progress: "[>]", cancelled: "[-]", pending: "[ ]" };
+export type LiveStatus = { type: "busy" | "idle"; message?: string };
 
-export function formatTodos(todos: Todo[]): string {
-  return todos.map((t) => `  ${TODO_MARK[t.status] ?? "[ ]"} ${t.content}`).join("\n");
-}
-
-export function progress(todos: Todo[]): string | undefined {
-  const relevant = todos.filter((t) => t.status !== "cancelled");
-  if (relevant.length === 0) return undefined;
-  return `${relevant.filter((t) => t.status === "completed").length}/${relevant.length} steps done`;
-}
-
-export function describeState(t: TaskRow, live: SessionStatus | undefined): string {
+export function describeState(t: TaskRow, live: LiveStatus | undefined): string {
   if (t.state === "running") {
-    if (live?.type === "retry") return `running (retrying after a provider error: ${truncate(live.message, 120)})`;
-    return live?.type === "busy" ? "running (working right now)" : "running";
+    if (live?.type === "busy") return "running (working right now)";
+    return "running";
   }
   if (t.state === "waiting") return "waiting for input from the user";
   if (t.state === "finished") return `finished (${t.outcome ?? "unknown outcome"})`;
@@ -101,7 +90,7 @@ export class Tasks {
     return t;
   }
 
-  async start(p: { title: string; brief: string; project?: string; model?: string; job?: string; reasoningVariant?: string }): Promise<TaskRow> {
+  async start(p: { title: string; brief: string; project?: string; model?: string; job?: string }): Promise<TaskRow> {
     if (this.store.get(KEY_DISK_LOW) === "1") {
       throw new UserError("The server is low on disk space, so new tasks are paused. Free some space first (the user has been told).");
     }
@@ -122,7 +111,6 @@ export class Tasks {
       await this.oc.ensureGitRepo(directory, this.cfg.PROJECTS_DIR);
       const session = await this.oc.createSession({ directory, title: `task: ${p.title}`, agent: this.cfg.WORKER_AGENT, metadata: { hq: { kind: "worker", slug } } });
       const modelRef = p.model ?? this.store.get(KEY_WORKER_MODEL) ?? this.cfg.WORKER_MODEL ?? null;
-      const reasoningVariant = validateReasoningEffort(p.reasoningVariant ?? this.cfg.REASONING_VARIANT);
       reserveReasoning(this.store, this.cfg, `task-${slug}-${Date.now()}`, session.id, p.job ? "scheduled-worker" : "worker", p.brief);
       const row = this.store.insertTask({
       slug,
@@ -132,7 +120,7 @@ export class Tasks {
       session_id: session.id,
       state: "running",
        model: modelRef,
-       reasoning_variant: reasoningVariant,
+       reasoning_variant: "default",
       job: p.job ?? null,
       created_at: Date.now(),
     });
@@ -151,13 +139,12 @@ export class Tasks {
         agent: this.cfg.WORKER_AGENT,
         model: modelRef ? parseModelRef(modelRef) : undefined,
         parts: [{ type: "text", text }],
-        variant: reasoningVariant,
       });
       } catch (err) {
         if (this.store.taskBySlug(slug)) this.store.updateTask(slug, { state: "failed", last_report: `Could not start: ${(err as Error).message}`, finished_at: Date.now() });
         throw err;
       }
-      log.info("task started", { slug, directory, sessionID: session.id, model: modelRef, variant: reasoningVariant });
+      log.info("task started", { slug, directory, sessionID: session.id, model: modelRef });
       return row;
     } catch (err) {
       this.store.releaseTaskReservation(token);
@@ -181,7 +168,6 @@ export class Tasks {
       agent: this.cfg.WORKER_AGENT,
       model: t.model ? parseModelRef(t.model) : undefined,
       parts: [{ type: "text", text: `[Message from the user, relayed by the assistant · ${stamp()}]\n${text}` }],
-      variant: t.reasoning_variant,
     }); } catch (err) { if (resumeToken) this.store.releaseTaskReservation(resumeToken); throw err; }
     if (resumeToken) this.store.releaseTaskReservation(resumeToken);
     this.store.updateTask(t.slug, { state: "running", outcome: null, finished_at: null, stuck_notified: 0 });
@@ -208,26 +194,19 @@ export class Tasks {
     if (tasks.length === 0) return "No tasks right now.";
     const lines = await Promise.all(
       tasks.map(async (t) => {
-        const [live, todos, session] = await Promise.all([
+        const [live, session] = await Promise.all([
           this.liveStatus(t),
-          this.oc.todo(t.session_id, t.directory).catch(() => [] as Todo[]),
           this.oc.getSession(t.session_id, t.directory).catch(() => undefined),
         ]);
         const pending = this.store.openApprovals().filter((a) => a.session_id === t.session_id).length;
         const bits = [
           describeState(t, live),
           t.state === "running" || t.state === "waiting" ? `for ${duration(Date.now() - t.created_at)}` : `${ago(t.updated_at)}`,
-          progress(todos),
           session ? usd(session.cost ?? 0) : undefined,
           t.state === "running" ? `last activity ${ago(t.last_activity_at)}` : undefined,
           pending > 0 ? `⚠️ waiting on your approval` : undefined,
         ].filter(Boolean);
-        let line = `- ${t.slug}: ${t.title} — ${bits.join(", ")}`;
-        if (t.state === "running") {
-          const doing = todos.find((x) => x.status === "in_progress")?.content;
-          if (doing) line += `\n  working on: ${truncate(doing, 120)}`;
-        }
-        return line;
+        return `- ${t.slug}: ${t.title} — ${bits.join(", ")}`;
       }),
     );
     return lines.join("\n");
@@ -236,9 +215,8 @@ export class Tasks {
   /** Detailed status for "where are we with X?". */
   async describe(ref: string): Promise<string> {
     const t = this.require(ref);
-    const [live, todos, session, msgs, pending] = await Promise.all([
+    const [live, session, msgs, pending] = await Promise.all([
       this.liveStatus(t),
-      this.oc.todo(t.session_id, t.directory).catch(() => [] as Todo[]),
       this.oc.getSession(t.session_id, t.directory).catch(() => undefined),
       this.oc.messages(t.session_id, t.directory, 12).catch(() => []),
       Promise.resolve(this.store.openApprovals().filter((a) => a.session_id === t.session_id)),
@@ -249,27 +227,21 @@ export class Tasks {
       `State: ${describeState(t, live)}`,
       `Started ${ago(t.created_at)}; last activity ${ago(t.last_activity_at)}; directory ${t.directory}`,
     ];
-    const prog = progress(todos);
-    if (prog) lines.push(`Progress: ${prog}`, formatTodos(todos));
-    else lines.push("Progress: the worker hasn't written a todo list yet");
-    if (session?.summary && session.summary.files > 0) {
-      lines.push(`Files changed: ${session.summary.files} (+${session.summary.additions} −${session.summary.deletions})`);
-    }
     if (session) lines.push(`Cost so far: ${usd(session.cost ?? 0)}`);
     for (const a of pending) {
-      const payload = JSON.parse(a.payload) as { permission?: string; patterns?: string[]; questions?: { question: string }[] };
+      const payload = JSON.parse(a.payload) as { action?: string; resources?: string[]; permission?: string; patterns?: string[]; fields?: { title?: string; key: string }[] };
       lines.push(
         a.kind === "permission"
-          ? `Waiting for the user's approval: ${payload.permission} ${(payload.patterns ?? []).join(" ")}`
-          : `Waiting for the user to answer: ${(payload.questions ?? []).map((q) => q.question).join(" / ")}`,
+          ? `Waiting for the user's approval: ${payload.action ?? payload.permission} ${(payload.resources ?? payload.patterns ?? []).join(" ")}`
+          : `Waiting for the user to answer: ${(payload.fields ?? []).map((f) => f.title ?? f.key).join(" / ")}`,
       );
     }
     if (t.state === "finished" || t.state === "waiting" || t.state === "failed") {
       if (t.last_report) lines.push(`Final report:\n${tail(t.last_report, 1500)}`);
     } else {
       const recent = msgs
-        .filter((m) => isAssistant(m.info))
-        .map((m) => messageText(m.parts))
+        .filter((m) => isAssistant(m))
+        .map((m) => messageText(m))
         .filter(Boolean)
         .slice(-2);
       if (recent.length) lines.push(`Latest from the worker:\n${tail(recent.join("\n\n"), 900)}`);
@@ -277,7 +249,7 @@ export class Tasks {
     return lines.join("\n");
   }
 
-  private async liveStatus(t: TaskRow): Promise<SessionStatus | undefined> {
+  private async liveStatus(t: TaskRow): Promise<LiveStatus | undefined> {
     if (t.state !== "running") return undefined;
     try {
       return (await this.oc.statuses(t.directory))[t.session_id];
@@ -306,9 +278,11 @@ export class Tasks {
   }
 
   onError(sessionID: string, error: unknown) {
-    const e = error as { name?: string; data?: { message?: string } } | undefined;
-    if (!e || e.name === "MessageAbortedError") return;
-    this.lastError.set(sessionID, `${e.name ?? "Error"}${e.data?.message ? `: ${e.data.message}` : ""}`);
+    const e = error as { type?: string; name?: string; message?: string; data?: { message?: string } } | undefined;
+    if (!e) return;
+    const text = `${e.type ?? e.name ?? "Error"}${e.message ? `: ${e.message}` : e.data?.message ? `: ${e.data.message}` : ""}`;
+    if (text.startsWith("MessageAbortedError")) return;
+    this.lastError.set(sessionID, text);
   }
 
   async onIdle(sessionID: string) {
@@ -325,9 +299,9 @@ export class Tasks {
     if (t.state === "finished" || t.state === "waiting") return; // already reported
 
     const msgs = await this.oc.messages(sessionID, t.directory, 10);
-    const last = msgs.filter((m) => isAssistant(m.info)).at(-1);
-    const report = last ? messageText(last.parts) : "";
-    const error = this.lastError.get(sessionID) ?? (last ? errorText(last.info) : undefined);
+    const last = msgs.filter((m) => isAssistant(m)).at(-1);
+    const report = last ? messageText(last) : "";
+    const error = this.lastError.get(sessionID) ?? (last ? errorText(last) : undefined);
     this.lastError.delete(sessionID);
 
     let reported: { state: TaskState; outcome?: string };

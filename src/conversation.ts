@@ -9,7 +9,7 @@ import type { Config } from "./config.ts";
 import { parseModelRef } from "./config.ts";
 import type { Store, UpdateRow } from "./db.ts";
 import { logger, newCorrelationId, runWithCorrelation } from "./log.ts";
-import { errorText, messageText, type ModelRef, type OpenCode } from "./opencode.ts";
+import { errorText, messageText, type Message, type ModelRef, type OpenCode } from "./opencode.ts";
 import type { Chat } from "./telegram/chat.ts";
 import { Delivery } from "./delivery.ts";
 import { isNoReply, stamp, stripNoReply, truncate } from "./text.ts";
@@ -165,8 +165,8 @@ export class Conversation {
     const ref = this.store.get(KEY_CHAT_MODEL) ?? this.cfg.CHAT_MODEL;
     if (ref) return ref;
     if (this.agentDefaultModel === undefined) {
-      const agent = (await this.oc.agents(this.directory).catch(() => [])).find((a) => a.name === this.cfg.ASSISTANT_AGENT);
-      this.agentDefaultModel = agent?.model ? `${agent.model.providerID}/${agent.model.modelID}` : "";
+      const agent = (await this.oc.agents(this.directory).catch(() => [])).find((a) => a.id === this.cfg.ASSISTANT_AGENT || a.name === this.cfg.ASSISTANT_AGENT);
+      this.agentDefaultModel = agent?.model ? `${agent.model.providerID}/${agent.model.id}` : "";
     }
     return this.agentDefaultModel || undefined;
   }
@@ -261,7 +261,7 @@ export class Conversation {
     this.turn = kind;
     this.turnUrgent = urgent;
     this.turnAttempt = attempt;
-    const turn = this.store.createTurn(kind, urgent, sessionID, this.cfg.REASONING_VARIANT, correlationId);
+    const turn = this.store.createTurn(kind, urgent, sessionID, "default", correlationId);
     this.turnID = turn.id;
     this.store.updateTurn(turn.id, "running", sessionID);
     log.debug(`turn ${turn.id} (${kind}) started`, { correlationId: turn.correlation_id, sessionID });
@@ -274,7 +274,6 @@ export class Conversation {
         agent: this.cfg.ASSISTANT_AGENT,
         model: this.chatModel(),
         parts: [{ type: "text", text }],
-        variant: this.cfg.REASONING_VARIANT,
       });
     } catch (err) {
       this.store.updateTurn(turn.id, "failed", sessionID);
@@ -364,26 +363,27 @@ export class Conversation {
     const delivered = new Set<string>(JSON.parse(this.store.get(KEY_DELIVERED) ?? "[]") as string[]);
 
     const done = (await this.oc.messages(sessionID, this.directory, 40))
-      .filter((m) => m.info.role === "assistant" && m.info.time.created >= since && !delivered.has(m.info.id))
-      .filter((m) => m.info.role === "assistant" && (m.info.time.completed !== undefined || m.info.error !== undefined))
-      .sort((a, b) => a.info.time.created - b.info.time.created);
+      .filter((m): m is Extract<Message, { type: "assistant" }> => m.type === "assistant")
+      .filter((m) => m.time.created >= since && !delivered.has(m.id))
+      .filter((m) => m.time.completed !== undefined || m.error !== undefined)
+      .sort((a, b) => a.time.created - b.time.created);
     if (done.length === 0) return;
 
-    const texts = done.map((m) => messageText(m.parts)).filter(Boolean);
+    const texts = done.map((m) => messageText(m)).filter(Boolean);
     // A turn that ends in NO_REPLY sends nothing, including any narration before it.
     const reply = texts.length === 0 || isNoReply(texts.at(-1)!) ? "" : stripNoReply(texts.join("\n\n"));
-    const errors = done.map((m) => errorText(m.info)).filter((e): e is string => !!e && !e.startsWith("MessageAbortedError"));
+    const errors = done.map((m) => errorText(m)).filter((e): e is string => !!e && !e.startsWith("MessageAbortedError"));
     const turn = turnID ? this.store.turn(turnID) : this.store.createTurn(kind ?? "user", urgent, sessionID);
     if (!turn) return;
 
     this.store.set(KEY_ACTIVITY, String(Date.now()));
-    const last = done.at(-1)!.info as { tokens?: { input?: number; cache?: { read?: number } } };
+    const last = done.at(-1)!;
     if (last.tokens) this.store.set(KEY_CONTEXT, String((last.tokens.input ?? 0) + (last.tokens.cache?.read ?? 0)));
 
     // A provider hiccup with nothing said yet: retry the turn, quietly, before telling the user.
     const transient = !reply && errors.length > 0 && errors.every((e) => TRANSIENT_ERROR.test(e));
     if (transient && attempt < this.maxRetries && (kind === "user" || kind === "update")) {
-      for (const m of done) delivered.add(m.info.id);
+      for (const m of done) delivered.add(m.id);
       this.store.set(KEY_DELIVERED, JSON.stringify([...delivered].slice(-300)));
       this.store.updateTurn(turn.id, "done", sessionID);
       // Bounded backoff: retryDelay, 4×retryDelay, each with ±25% jitter.
@@ -401,9 +401,9 @@ export class Conversation {
     const correlation = turn.correlation_id ?? newCorrelationId("out");
     await runWithCorrelation(correlation, async () => {
       for (const [i, text] of [reply, errorNotice].filter(Boolean).entries()) {
-        this.store.enqueueOutbound({ id: `turn-${turn.id}-${i}`, sessionID, turnID: turn.id, sourceMessageID: done.at(-1)!.info.id, kind: errors.length && i === 1 ? "error" : "text", payload: { text }, urgent: urgent || kind === "user", chunks: [text], correlationID: correlation });
+        this.store.enqueueOutbound({ id: `turn-${turn.id}-${i}`, sessionID, turnID: turn.id, sourceMessageID: done.at(-1)!.id, kind: errors.length && i === 1 ? "error" : "text", payload: { text }, urgent: urgent || kind === "user", chunks: [text], correlationID: correlation });
       }
-      for (const m of done) delivered.add(m.info.id);
+      for (const m of done) delivered.add(m.id);
       this.store.set(KEY_DELIVERED, JSON.stringify([...delivered].slice(-300)));
       await this.delivery.flush();
     });
@@ -478,7 +478,6 @@ export class Conversation {
           agent: this.cfg.ASSISTANT_AGENT,
           model: this.chatModel(),
           noReply: true,
-          variant: this.cfg.REASONING_VARIANT,
           parts: [
             {
               type: "text",

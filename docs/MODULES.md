@@ -94,10 +94,10 @@ watchdog, and a 20-second housekeeping tick. Guards against overlapping ticks.
 ## Boundaries
 
 ### `src/opencode.ts`
-The only module that talks to the OpenCode server (pinned `@opencode-ai/sdk/v2` 1.18.34):
-sessions, prompts, statuses, messages, todos, permissions/questions, providers, MCP status,
-files, PTYs, and the reconnecting global event stream. `validateReasoningEffort` enforces the
-supported variant.
+The only module that talks to the OpenCode server (v2 HTTP API under `/api/*`, server 2.0.x,
+plain fetch — no SDK): sessions, prompts (with agent/model switching), inbox, messages,
+permissions/forms (v2's questions), agents/models, MCP status, files, PTYs, and the
+reconnecting global event stream (`/api/event` SSE).
 
 ### `src/telegram/chat.ts`
 The fakeable `Chat` interface and its grammY implementation: `sendText`, `sendChunk`,

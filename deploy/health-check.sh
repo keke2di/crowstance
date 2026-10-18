@@ -39,7 +39,7 @@ if [ -z "${OPENCODE_URL:-}" ] && [ -z "${OPENCODE_PORT:-}" ]; then
   OPENCODE_PORT="$(env_value "$ETC/opencode.env" OPENCODE_PORT)"
 fi
 OPENCODE_URL="${OPENCODE_URL:-http://127.0.0.1:${OPENCODE_PORT:-4096}}"
-# OpenCode protects every endpoint, /global/health included, with its server password. As the unit's
+# OpenCode protects every endpoint, /api/info included, with its server password. As the unit's
 # ExecStartPost (crow-agent) it comes from the unit environment; as root it is read from the env file.
 OC_USER="${OPENCODE_SERVER_USERNAME:-$(env_value "$ETC/opencode.env" OPENCODE_SERVER_USERNAME)}"
 OC_USER="${OC_USER:-opencode}"
@@ -56,9 +56,9 @@ opencode_ready() {
   if [ -n "$OC_PASS" ]; then
     # Credentials go in on stdin (curl --config -), never on the command line where `ps` would show them.
     printf 'user = "%s:%s"\n' "$OC_USER" "$OC_PASS" \
-      | "$CURL" -fsS --max-time "$TIMEOUT" --config - "${OPENCODE_URL%/}/global/health" >/dev/null
+      | "$CURL" -fsS --max-time "$TIMEOUT" --config - "${OPENCODE_URL%/}/api/info" >/dev/null
   else
-    "$CURL" -fsS --max-time "$TIMEOUT" "${OPENCODE_URL%/}/global/health" >/dev/null
+    "$CURL" -fsS --max-time "$TIMEOUT" "${OPENCODE_URL%/}/api/info" >/dev/null
   fi
 }
 
@@ -83,11 +83,11 @@ run_check() { # label command...
 
 case "$MODE" in
   gateway) run_check "gateway readiness endpoint http://127.0.0.1:${HQ_PORT}/ready is not ready" gateway_ready ;;
-  opencode) run_check "OpenCode health endpoint ${OPENCODE_URL%/}/global/health is not ready" opencode_ready ;;
+  opencode) run_check "OpenCode health endpoint ${OPENCODE_URL%/}/api/info is not ready" opencode_ready ;;
   all)
     run_check "unit crowstance-opencode.service is not active" unit_active crowstance-opencode.service
     run_check "unit crowstance-gateway.service is not active" unit_active crowstance-gateway.service
-    run_check "OpenCode health endpoint ${OPENCODE_URL%/}/global/health is not ready" opencode_ready
+    run_check "OpenCode health endpoint ${OPENCODE_URL%/}/api/info is not ready" opencode_ready
     run_check "gateway readiness endpoint http://127.0.0.1:${HQ_PORT}/ready is not ready" gateway_ready
     ;;
 esac
