@@ -25,7 +25,7 @@ You (Telegram) ──► gateway (this repo, Node 24) ──► opencode serve (
 | Path | What |
 |---|---|
 | `src/index.ts` | wiring, event dispatch |
-| `src/opencode.ts` | the only module that talks to OpenCode (swap point for OpenCode 2.x) |
+| `src/opencode.ts` | the only module that talks to OpenCode 2.x (`/api/*` REST + SSE; swap point for future server bumps) |
 | `src/conversation.ts` | main chat: debounce, queue-while-busy, typing, durable retrying delivery, `NO_REPLY` |
 | `src/delivery.ts` | durable outbound worker: leases, retries, duplicate-over-loss policy |
 | `src/tasks.ts` | background workers and status reports |
