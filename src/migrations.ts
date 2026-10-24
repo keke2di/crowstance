@@ -142,6 +142,27 @@ export const MIGRATIONS: { version: number; sql: string }[] = [
       CREATE INDEX IF NOT EXISTS permission_grants_session ON permission_grants(session_id);
     `,
   },
+  {
+    // Subagents and spend caps. OpenCode reports each session's usage as a running total,
+    // so session_costs keeps the last total seen and spend records only the increase.
+    // subagent_runs is one row per hq_delegate call; running rows are never pruned.
+    version: 9,
+    sql: `
+      CREATE TABLE IF NOT EXISTS session_costs (
+        session_id TEXT PRIMARY KEY, oc_cost REAL NOT NULL DEFAULT 0, tokens TEXT NOT NULL DEFAULT '{}',
+        cost REAL NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS subagent_runs (
+        id INTEGER PRIMARY KEY, parent_session TEXT NOT NULL, turn_id INTEGER, kind TEXT NOT NULL,
+        session_id TEXT UNIQUE, prompt TEXT NOT NULL, model TEXT, effort TEXT, model_from TEXT,
+        state TEXT NOT NULL DEFAULT 'running', detached INTEGER NOT NULL DEFAULT 0,
+        started_at INTEGER NOT NULL, finished_at INTEGER, result TEXT, error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS subagent_runs_state ON subagent_runs(state, started_at);
+      CREATE INDEX IF NOT EXISTS subagent_runs_turn ON subagent_runs(turn_id);
+      ALTER TABLE tasks ADD COLUMN model_from TEXT;
+    `,
+  },
 ];
 
 export function migrate(db: Database.Database) {

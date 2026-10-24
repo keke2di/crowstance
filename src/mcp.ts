@@ -16,7 +16,11 @@ import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { logger, newCorrelationId, runWithCorrelation } from "./log.ts";
 import { crowbotBalance, describeBalance } from "./provider.ts";
+import type { Kinds } from "./kinds.ts";
+import type { Limits } from "./limits.ts";
+import type { Roles } from "./roles.ts";
 import type { Scheduler } from "./scheduler.ts";
+import type { Subagents } from "./subagents.ts";
 import { UserError, type Tasks } from "./tasks.ts";
 import { startOfLocalDay, startOfLocalMonth, truncate, usd } from "./text.ts";
 import type { Vault } from "./vault.ts";
@@ -27,7 +31,43 @@ const log = logger("hq");
 export type MappedLocationPayload = { delivery: "location" | "venue"; latitude: number; longitude: number; name: string; address?: string; maps_url?: string; source: string; confidence: string };
 export type DependencyCheck = { ok: boolean; detail?: string };
 export type ReadinessReport = { ready: boolean; checks: Record<string, DependencyCheck> };
-type Deps = { cfg: Config; store: Store; tasks: Tasks; scheduler: Scheduler; onUpdate: () => void; geocoder?: Geocoder; vault?: Vault; readiness?: () => Promise<ReadinessReport> };
+type Deps = {
+  cfg: Config;
+  store: Store;
+  tasks: Tasks;
+  scheduler: Scheduler;
+  onUpdate: () => void;
+  geocoder?: Geocoder;
+  vault?: Vault;
+  readiness?: () => Promise<ReadinessReport>;
+  /** Subagents: hq_delegate is offered only when these are wired and at least one kind exists. */
+  subagents?: Subagents;
+  kinds?: Kinds;
+  roles?: Roles;
+  limits?: Limits;
+};
+
+/**
+ * hq_delegate's description: what each kind is for. OpenCode keeps a tool list from when it
+ * connected, so this holds only what changes with the kinds themselves (index.ts reconnects hq
+ * when they do); models and caps, which /model and /limits change any time, are in each result.
+ */
+export function delegateDescription(kinds: Kinds): string {
+  const lines = kinds.list().map((k) => `- ${k.id}: ${k.description}${k.when ? ` Good for: ${k.when}` : ""}${k.tools ? ` Tools: ${k.tools.join(", ")}.` : ""}`);
+  return [
+    "Hand one focused, self-contained job to a subagent and get its answer back in this turn. The subagent can't see this " +
+      "conversation or ask anything, so the prompt must say exactly what to find or work out and what to report. Use it for " +
+      "lookups and analysis that would bloat your context or need a different strength; do quick things yourself, and send " +
+      "long or multi-step work (building, writing files, research reports) to task_start instead. Independent delegations can " +
+      "run at the same time (Promise.allSettled in one execute). Pick the kind whose job and tools fit; the gateway knows which " +
+      "model each kind runs on and says in the result which one ran and what it cost, so only pass `model` when the user " +
+      "asked for a specific one. Calls are capped " +
+      "per call, per turn, at once and per day; a refused call says which cap and means: do it yourself or ask the user. A " +
+      "slow one returns early and its answer arrives later as an update.",
+    "Kinds:",
+    ...lines,
+  ].join("\n");
+}
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
 const ok = (text: string): ToolResult => ({ content: [{ type: "text", text }] });
@@ -42,9 +82,25 @@ async function guarded(name: string, fn: () => Promise<string> | string): Promis
   }
 }
 
-export function buildMcpServer({ cfg, store, tasks, scheduler, geocoder, vault }: Deps): McpServer {
+export function buildMcpServer({ cfg, store, tasks, scheduler, geocoder, vault, subagents, kinds, roles, limits }: Deps): McpServer {
   const server = new McpServer({ name: "hq", version: "0.1.0" });
   const locationGeocoder = geocoder ?? configuredGeocoder(cfg);
+
+  const kindIds = kinds?.list().map((k) => k.id) ?? [];
+  if (subagents && kinds && roles && limits && kindIds.length) {
+    server.registerTool(
+      "delegate",
+      {
+        description: delegateDescription(kinds),
+        inputSchema: {
+          kind: z.enum(kindIds as [string, ...string[]]).describe("Which kind of subagent"),
+          prompt: z.string().min(20).describe("Complete, self-contained instructions: what to find or work out, and what to report back"),
+          model: z.string().optional().describe("provider/model override; only when the user asked for a specific model"),
+        },
+      },
+      ({ kind, prompt, model }) => guarded("delegate", () => subagents.delegate({ kind, prompt, ...(model ? { model } : {}) })),
+    );
+  }
 
   server.registerTool("location_share", {
     description: "Send the owner one Telegram-native tappable map location. Use this when they ask where a place is or ask you to send a place. Prefer confident coordinates; otherwise geocode a specific address/place. Ambiguous results are returned for the user to choose and never sent automatically. This tool cannot target another chat.",
@@ -93,7 +149,9 @@ export function buildMcpServer({ cfg, store, tasks, scheduler, geocoder, vault }
     },
     () =>
       guarded("provider_balance", async () => {
-        const spend = `spent by this assistant: ${usd(store.spendSince(startOfLocalDay()))} today, ${usd(store.spendSince(startOfLocalMonth()))} this month (daily budget ${usd(cfg.DAILY_BUDGET_USD)})`;
+        const daily = limits?.get("daily") ?? cfg.DAILY_BUDGET_USD;
+        const monthly = limits ? `, monthly ${usd(limits.get("monthly"))}` : "";
+        const spend = `spent by this assistant: ${usd(store.spendSince(startOfLocalDay()))} today, ${usd(store.spendSince(startOfLocalMonth()))} this month (daily budget ${usd(daily)}${monthly})`;
         if (!cfg.CROWBOT_API_KEY) return `${spend}. The provider balance isn't available (no key configured for the gateway).`;
         return `${describeBalance(await crowbotBalance(cfg.CROWBOT_API_KEY))}; ${spend}`;
       }),
@@ -196,7 +254,12 @@ export function buildMcpServer({ cfg, store, tasks, scheduler, geocoder, vault }
       description: "List background tasks: active ones plus those finished recently, with state, progress, cost and last activity.",
       inputSchema: { include_finished_hours: z.number().min(0).max(24 * 30).optional().describe("How far back to include finished tasks (default 24)") },
     },
-    ({ include_finished_hours }) => guarded("task_list", () => tasks.list(include_finished_hours ?? 24)),
+    ({ include_finished_hours }) =>
+      guarded("task_list", async () => {
+        const list = await tasks.list(include_finished_hours ?? 24);
+        const delegations = subagents?.list(include_finished_hours ?? 24);
+        return delegations ? `${list}\n\n${delegations}` : list;
+      }),
   );
 
   server.registerTool(

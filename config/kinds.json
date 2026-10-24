@@ -1,0 +1,26 @@
+{
+  "$comment": "What subagents run on (docs/SUBAGENTS.md). `every` is the default model and effort for all subagent kinds; an entry under `kinds` overrides it for one kind, and /model overrides both. The kinds themselves (prompt and tools) are OpenCode agents with mode 'subagent' in opencode/opencode.json; `when` tells the chat what to send each one. Changing this file only needs a gateway restart.",
+  "every": { "model": "crowbot/deepseek-v4.1-flash", "effort": "medium" },
+  "workers": { "model": "crowbot/gpt-6.1-sol", "effort": "high" },
+  "kinds": {
+    "explore": {
+      "effort": "low",
+      "when": "Find something and report it: where a file or setting is, what a page or document says, a quick fact check.",
+      "max_call_usd": 0.15,
+      "timeout_sec": 300
+    },
+    "research": {
+      "model": "crowbot/gpt-6.1-sol",
+      "effort": "medium",
+      "when": "A question that needs several sources read, compared and summarised, with links.",
+      "max_call_usd": 0.4
+    },
+    "analyst": {
+      "model": "crowbot/kimi-k3",
+      "effort": "high",
+      "when": "Think hard about one question, plan, document or piece of code and give a reasoned answer or review.",
+      "max_call_usd": 0.5
+    },
+    "general": { "enabled": false }
+  }
+}

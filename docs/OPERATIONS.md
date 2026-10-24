@@ -48,7 +48,9 @@ Watch for:
 - `outbound.retryable` / `outbound.unknown` growing, or `outbound.retries` climbing — Telegram
   delivery is degraded. `outbound.failed` is a permanent failure that needs attention.
 - `approvals.open` with a large `oldestAgeMs` — a request is waiting on the owner.
-- `spend.today` approaching `DAILY_BUDGET_USD` / `REASONING_DAILY_BUDGET_USD`.
+- `spend.today` approaching the daily cap (`/limits daily` in Telegram; `DAILY_BUDGET_USD` is
+  its ceiling) or `REASONING_DAILY_BUDGET_USD`. Spend is recorded as increases of OpenCode's
+  per-session running totals, priced at the higher of OpenCode's and crowbot's figure.
 
 ## 4. Upgrade
 
@@ -69,7 +71,8 @@ When prompts or `opencode/opencode.json` change, the update is refused unless yo
 deploy/deploy.sh USER@HOST --restart-opencode
 ```
 
-Restarting OpenCode interrupts running tasks, so do it when workers are idle.
+Restarting OpenCode interrupts running tasks, so do it when workers are idle. A change to
+`config/kinds.json` alone (subagent models, effort, caps) only restarts the gateway.
 
 ## 5. Rollback
 
@@ -97,11 +100,18 @@ release is not the last known-good one. Releases are never deleted by a rollback
    delivery logs. A permanent failure stays in the ledger for inspection; retryable chunks
    retry with bounded backoff. The policy is duplicate-over-loss: never assume a timeout means
    the message was not delivered.
-4. **Provider or budget problem?** Check `/cost` in Telegram or `hq_provider_balance`.
-   `REASONING_DAILY_BUDGET_USD` blocks new reasoning work; `DAILY_BUDGET_USD` blocks new tasks.
-5. **Disk low?** New tasks pause automatically below `DISK_MIN_FREE_GB` and the owner is told.
-6. **Interrupted deploy?** Run `sudo bash /opt/crowstance/app/deploy/release.sh recover`.
-7. **Suspect credential exposure?** Rotate the affected secret, restart the service, and follow
+4. **Provider or budget problem?** Check `/cost` and `/limits` in Telegram, or
+   `hq_provider_balance`. A reached cap refuses new work and says which cap; the daily and
+   monthly caps also stop running workers and subagents and tell the owner once. Below
+   `BALANCE_FLOOR_USD` no new background work starts. `REASONING_DAILY_BUDGET_USD` still
+   blocks new reasoning work on its own.
+5. **Chat stuck "thinking"?** It is usually waiting on a permission or question prompt. The
+   gateway shows any prompt OpenCode is waiting on within three minutes, even if its event was
+   missed, so look for buttons in the chat; `/stop` interrupts the turn and its subagents.
+   `/tasks` lists running delegations.
+6. **Disk low?** New tasks pause automatically below `DISK_MIN_FREE_GB` and the owner is told.
+7. **Interrupted deploy?** Run `sudo bash /opt/crowstance/app/deploy/release.sh recover`.
+8. **Suspect credential exposure?** Rotate the affected secret, restart the service, and follow
    section 9. Do not paste secrets into chat or tickets.
 
 ## 7. Backups and recovery
@@ -168,3 +178,35 @@ sudo bash /opt/crowstance/app/deploy/setup.sh
 Put operator overrides in `/etc/crowstance/gateway.env.local` and re-run `setup.sh`; manual
 settings in `setup.env` are remembered across runs. Provider keys live in
 `/etc/crowstance/opencode.env`.
+
+## 11. Models, subagents and spend caps
+
+Design and rationale: `docs/SUBAGENTS.md`. Day to day it is all Telegram:
+
+- `/model` shows what the chat, all subagents, each subagent kind and the workers run on, and
+  where that came from. Picks made there are stored in the database and survive deploys.
+- `/limits` shows each cap with its ceiling and current use; `/limits daily 5` tightens one,
+  `/limits daily default` resets it. The env values (`DAILY_BUDGET_USD`, `MONTHLY_BUDGET_USD`,
+  `SUBAGENT_*`, `TASK_MAX_USD`, `MODEL_MAX_PRICE_PER_1M`, `BALANCE_FLOOR_USD`) are ceilings:
+  raise one in `/etc/crowstance/gateway.env.local`, re-run `setup.sh`, restart the gateway.
+
+The defaults live in the release: `config/kinds.json` (each kind's model, effort, jobs and caps;
+`every` is the default for all kinds) and the subagent agents (prompt and tools) in
+`opencode/opencode.json`. Change them in the repository and deploy; a kinds.json-only change
+restarts just the gateway, an `opencode/` change needs `--restart-opencode`.
+
+crowbot adds and reprices models over time. The gateway prices spend with crowbot's live
+catalog either way, but OpenCode can only run models listed in `opencode/opencode.json`. When
+the assistant mentions catalog drift, or `npm run doctor` warns about it, refresh the list from
+the operator machine (it needs `CROWBOT_API_KEY` in the environment or `.env`):
+
+```bash
+npm run models:sync -- --check
+npm run models:sync
+git diff opencode/opencode.json
+deploy/deploy.sh USER@HOST --restart-opencode
+```
+
+A model named in `config/kinds.json` or picked with `/model` that crowbot stops serving, or that
+is over the price ceiling, is refused rather than swapped for another: delegations to that kind
+fail with the reason and `/model` shows it with ⚠️ until it is changed.

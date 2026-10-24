@@ -1,9 +1,14 @@
 import type http from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { Catalog } from "../src/catalog.ts";
+import { Kinds } from "../src/kinds.ts";
+import { Limits } from "../src/limits.ts";
 import { startHqServer } from "../src/mcp.ts";
 import type { Geocoder } from "../src/geocoder.ts";
+import { Roles } from "../src/roles.ts";
 import { Scheduler } from "../src/scheduler.ts";
+import { Subagents } from "../src/subagents.ts";
 import { Tasks } from "../src/tasks.ts";
 import { FakeOpenCode, memoryStore, testConfig } from "./fakes.ts";
 
@@ -142,5 +147,44 @@ describe("/mcp", () => {
     const started = await rpc("tools/call", { name: "task_start", arguments: { title: "Uptime page", brief: "Build a tiny status page for my sites" } });
     expect(started.body?.result?.content?.[0]?.text).toMatch(/^Started task uptime-page in /);
     expect(oc.prompts.at(-1)!.text).toContain("Build a tiny status page");
+  });
+});
+
+describe("hq_delegate", () => {
+  it("is offered with every discovered kind, what it is for and its tools", async () => {
+    const dcfg = testConfig({ HQ_PORT: "0" });
+    const dstore = memoryStore();
+    const doc = new FakeOpenCode();
+    const catalog = new Catalog({ cfg: dcfg, store: dstore, oc: doc.asOpenCode() });
+    const kinds = new Kinds({
+      cfg: dcfg,
+      oc: doc.asOpenCode(),
+      policy: { kinds: { explore: { effort: "low", when: "quick lookups", max_call_usd: 0.15 } } },
+      agentTools: { explore: { edit: false, write: false, bash: false, execute: false } },
+      retryDelaysMs: [],
+    });
+    await Promise.all([catalog.refresh(), kinds.refresh()]);
+    const limits = new Limits({ cfg: dcfg, store: dstore, catalog, kinds });
+    const roles = new Roles({ cfg: dcfg, store: dstore, catalog, kinds });
+    const subagents = new Subagents({ cfg: dcfg, store: dstore, oc: doc.asOpenCode(), kinds, roles, limits, parent: () => ({ sessionID: "ses_main" }), onUpdate: () => {} });
+    const dtasks = new Tasks({ cfg: dcfg, store: dstore, oc: doc.asOpenCode(), onUpdate: () => {} });
+    const dsched = new Scheduler({ cfg: dcfg, store: dstore, tasks: dtasks, oc: doc.asOpenCode(), onUpdate: () => {}, housekeeping: async () => {} });
+    const s = await startHqServer({ cfg: dcfg, store: dstore, tasks: dtasks, scheduler: dsched, onUpdate: () => {}, subagents, kinds, roles, limits });
+    try {
+      const port = (s.address() as AddressInfo).port;
+      const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${dcfg.HQ_MCP_TOKEN}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+      });
+      const tools = ((await res.json()) as { result: { tools: { name: string; description: string; inputSchema: { properties: { kind: { enum: string[] } } } }[] } }).result.tools;
+      const delegate = tools.find((t) => t.name === "delegate")!;
+      expect(delegate.inputSchema.properties.kind.enum).toEqual(["explore", "analyst"]);
+      expect(delegate.description).toContain("- explore: Finds things and reports them Good for: quick lookups Tools: read, glob, grep, webfetch, websearch.");
+      expect(delegate.description).toContain("- analyst: Thinks hard about one question");
+    } finally {
+      s.close();
+      dsched.stop();
+    }
   });
 });

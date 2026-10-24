@@ -16,7 +16,7 @@ describe("durable ledger", () => {
     store.close();
     const reopened = new Store(file); stores.push(reopened);
     expect(reopened.inbound(row.id)?.reply_to).toBe("old");
-    expect((reopened.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number }).version).toBe(8);
+    expect((reopened.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number }).version).toBe(9);
   });
 
   it("persists successful approval snapshot watermarks", () => {

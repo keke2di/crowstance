@@ -2,15 +2,22 @@ import path from "node:path";
 import fs from "node:fs";
 import { InlineKeyboard } from "grammy";
 import { Approvals } from "./approvals.ts";
+import { Catalog } from "./catalog.ts";
 import { loadConfig, type Config } from "./config.ts";
 import { Conversation } from "./conversation.ts";
 import { Delivery } from "./delivery.ts";
-import { Store } from "./db.ts";
+import { Store, type TokenTotals } from "./db.ts";
+import { Kinds } from "./kinds.ts";
+import { Limits, type Breach } from "./limits.ts";
 import { logger, setLogLevel } from "./log.ts";
 import { startHqServer, type DependencyCheck, type ReadinessReport } from "./mcp.ts";
 import { OpenCode, type GlobalEvent } from "./opencode.ts";
+import { crowbotBalance } from "./provider.ts";
+import { Roles } from "./roles.ts";
 import { Scheduler } from "./scheduler.ts";
+import { Subagents } from "./subagents.ts";
 import { Tasks } from "./tasks.ts";
+import { usd } from "./text.ts";
 import { COMMAND_MENU, createBot, registerHandlers } from "./telegram/bot.ts";
 import { TelegramChat } from "./telegram/chat.ts";
 import { loadVaultKey, Vault } from "./vault.ts";
@@ -95,7 +102,7 @@ async function main() {
     const now = Date.now();
     if (now - Number(store.get("retention.last") ?? 0) < 24 * 3_600_000) return;
     const cutoff = now - cfg.RETENTION_DAYS * 86_400_000;
-    const deleted = store.applyRetention({ updatesBefore: cutoff, inboundBefore: cutoff, outboundBefore: cutoff, approvalsBefore: cutoff, turnsBefore: cutoff, attemptsBefore: cutoff });
+    const deleted = store.applyRetention({ updatesBefore: cutoff, inboundBefore: cutoff, outboundBefore: cutoff, approvalsBefore: cutoff, turnsBefore: cutoff, attemptsBefore: cutoff, subagentsBefore: cutoff });
     store.set("retention.last", String(now));
     const total = Object.values(deleted).reduce((sum, n) => sum + n, 0);
     if (total > 0) log.info("retention pruned terminal history", deleted);
@@ -123,12 +130,113 @@ async function main() {
         });
     },
   });
+  // Subagents, model routing and spend caps.
+  const catalog = new Catalog({ cfg, store, oc });
+  const kinds = new Kinds({ cfg, oc });
+  let roles: Roles;
+  /** What a session runs on, so its tokens can be priced with crowbot's catalog. */
+  const modelFor = (sessionID: string): string | undefined => {
+    if (sessionID === conversation.sessionID) {
+      try {
+        return roles.resolve("chat").ref;
+      } catch {
+        return undefined;
+      }
+    }
+    return store.taskBySession(sessionID)?.model ?? store.subagentRunBySession(sessionID)?.model ?? undefined;
+  };
+  const crowbotKey = cfg.CROWBOT_API_KEY;
+  const limits = new Limits({ cfg, store, catalog, kinds, modelFor, ...(crowbotKey ? { balance: async () => (await crowbotBalance(crowbotKey)).balanceUsd } : {}) });
+  roles = new Roles({ cfg, store, catalog, kinds, maxPrice: () => limits.get("price") });
+  const subagents = new Subagents({ cfg, store, oc, kinds, roles, limits, parent: () => conversation.currentTurn(), onUpdate: kick });
+  tasks.attach({ roles, limits });
+  conversation.attach({ roles, limits, subagents });
+
+  /** Interrupt whatever a live usage event says broke a cap. Period caps tell the owner once a day. */
+  const handleBreaches = async (breaches: Breach[]) => {
+    for (const b of breaches) {
+      switch (b.cap) {
+        case "task":
+          await tasks.stopForCap(b.sessionID, `it reached its ${usd(b.limit)} cost cap (spent ${usd(b.spent)})`);
+          break;
+        case "call":
+          await subagents.stop(b.runID, "capped", `reached its ${usd(b.limit)} cap`);
+          break;
+        case "turn":
+          await subagents.stopTurn(b.turnID, "capped", `this turn's delegations reached ${usd(b.limit)}`);
+          break;
+        case "subagents":
+          await subagents.stopAll("capped", `today's subagent budget of ${usd(b.limit)} is used up`);
+          if (limits.firstTrip("subagents")) log.warn(`subagent budget reached: ${usd(b.spent)} of ${usd(b.limit)}`);
+          break;
+        case "daily":
+        case "monthly": {
+          const why = `the ${b.cap} budget of ${usd(b.limit)} is used up (${usd(b.spent)})`;
+          await subagents.stopAll("capped", why);
+          await tasks.stopAll(why);
+          if (limits.firstTrip(b.cap)) {
+            log.warn(`${b.cap} budget reached; stopped background work`);
+            await chat
+              .sendText(`⚠️ Spending cap: ${why}. I stopped background work and won't start more until it resets or you raise it (/limits).`, { bubbles: false })
+              .catch((err) => log.warn(`cap notice not delivered: ${(err as Error).message}`));
+          }
+          break;
+        }
+      }
+    }
+  };
+
+  /** Tell the assistant once when crowbot's catalog and OpenCode's model list drift apart. */
+  const refreshCatalog = async () => {
+    await catalog.refresh();
+    if (!catalog.hasCrowbot()) return;
+    const drift = catalog.drift();
+    const signature = JSON.stringify(drift);
+    if ((drift.missing.length || drift.prices.length) && store.get("catalog.driftNotified") !== signature) {
+      store.set("catalog.driftNotified", signature);
+      const bits = [
+        drift.missing.length ? `crowbot serves ${drift.missing.join(", ")}, which OpenCode can't run yet` : "",
+        drift.prices.length ? `opencode.json has stale prices for ${drift.prices.map((p) => p.id).join(", ")} (caps use crowbot's)` : "",
+      ].filter(Boolean);
+      log.warn(`model catalog drift: ${bits.join("; ")}`);
+      store.enqueueUpdate("system", `Model catalog drift: ${bits.join("; ")}. The operator can fix it with \`npm run models:sync\` and a redeploy. Mention it to the user only if they ask about models.`);
+    }
+  };
+
+  /**
+   * Rediscover the kinds. OpenCode lists hq's tools once when it connects and keeps that list, and
+   * hq_delegate exists (with its kind enum) only once kinds are known, so reconnect hq when they change.
+   */
+  let kindSignature = "";
+  const syncKinds = async () => {
+    const complete = await kinds.refresh();
+    const signature = kinds.list().map((k) => `${k.id}:${k.when ?? ""}:${(k.tools ?? []).join("+")}`).join(",");
+    if (signature !== kindSignature) {
+      kindSignature = signature;
+      await oc.mcpReconnect("hq", cfg.ASSISTANT_HOME).catch((err) => log.warn(`could not reconnect hq to refresh its tools: ${(err as Error).message}`));
+      log.info(`subagent kinds: ${kinds.list().map((k) => `${k.id} → ${roles.describe(k.id)}`).join("; ") || "none"}`);
+    }
+    return complete;
+  };
+
   const labelFor = (sessionID: string) => {
     if (sessionID === conversation.sessionID) return "me (main chat)";
     const t = store.taskBySession(sessionID);
-    return t ? `task ${t.slug}` : "another session";
+    if (t) return `task ${t.slug}`;
+    const kind = subagents.kindOf(sessionID);
+    return kind ? `subagent ${kind} (for me)` : "another session";
   };
   const approvals = new Approvals({ store, oc, chat, labelFor, isQuiet });
+  /**
+   * Every few minutes, show any permission or question OpenCode is waiting on that we never saw
+   * (a missed or renamed event), so a turn can't sit blocked on a prompt nobody was shown.
+   */
+  let lastSweep = 0;
+  const sweepApprovals = async () => {
+    if (Date.now() - lastSweep < 3 * 60_000) return;
+    lastSweep = Date.now();
+    await approvals.reconcile([cfg.ASSISTANT_HOME, ...tasks.directories()]).catch((err) => log.warn(`approval sweep failed: ${(err as Error).message}`));
+  };
   scheduler = new Scheduler({
     cfg,
     store,
@@ -138,20 +246,32 @@ async function main() {
     housekeeping: async () => {
       await approvals.nudge();
       await conversation.watchdog();
+      await limits.refreshBalance();
+      await sweepApprovals();
       pruneHistory();
     },
   });
 
   // The MCP endpoint must be up before OpenCode tries to connect to it.
-  const hq = await startHqServer({ cfg, store, tasks, scheduler, onUpdate: kick, vault, readiness });
+  const hq = await startHqServer({ cfg, store, tasks, scheduler, onUpdate: kick, vault, readiness, subagents, kinds, roles, limits });
   await oc.waitUntilHealthy();
   await ensureHqConnected(oc, cfg);
+  // The catalog first, so the kinds' models are resolved (and logged) against crowbot's list.
+  await Promise.all([refreshCatalog(), limits.refreshBalance()]);
+  const kindsComplete = await syncKinds();
+  if (!kindsComplete) setTimeout(() => void syncKinds(), 30_000).unref();
+  subagents.recover();
   await conversation.ensureMainSession();
+  const catalogTimer = setInterval(() => void refreshCatalog().catch((err) => log.warn(`catalog refresh failed: ${(err as Error).message}`)), cfg.CATALOG_REFRESH_MIN * 60_000);
+  catalogTimer.unref();
 
   const reconcile = async () => {
     await ensureHqConnected(oc, cfg);
+    await syncKinds();
+    await refreshCatalog().catch((err) => log.warn(`catalog refresh failed: ${(err as Error).message}`));
     await conversation.reconcile();
     await tasks.reconcile();
+    await subagents.reconcile();
     await approvals.reconcile([cfg.ASSISTANT_HOME, ...tasks.directories()]);
   };
 
@@ -166,13 +286,14 @@ async function main() {
       case "session.execution.started": {
         if (!sessionID) return;
         if (sessionID === conversation.sessionID) conversation.onMainBusy();
-        else tasks.onBusy(sessionID);
+        else if (!subagents.isSubagent(sessionID)) tasks.onBusy(sessionID);
         return;
       }
       case "session.execution.succeeded": {
         if (!sessionID) return;
         if (sessionID === conversation.sessionID) void conversation.onMainIdle();
         else if (tasks.isWorker(sessionID)) await tasks.onIdle(sessionID);
+        else if (subagents.isSubagent(sessionID)) void subagents.onIdle(sessionID, "succeeded");
         return;
       }
       case "session.execution.interrupted": {
@@ -180,6 +301,7 @@ async function main() {
         if (!sessionID) return;
         if (sessionID === conversation.sessionID) void conversation.onMainIdle();
         else if (tasks.isWorker(sessionID)) await tasks.onIdle(sessionID);
+        else if (subagents.isSubagent(sessionID)) void subagents.onIdle(sessionID, "interrupted");
         return;
       }
       case "session.execution.failed": {
@@ -187,30 +309,42 @@ async function main() {
         tasks.onError(sessionID, d.error);
         if (sessionID === conversation.sessionID) void conversation.onMainIdle();
         else if (tasks.isWorker(sessionID)) await tasks.onIdle(sessionID);
+        else if (subagents.isSubagent(sessionID)) {
+          subagents.onError(sessionID, d.error);
+          void subagents.onIdle(sessionID, "failed");
+        }
         return;
       }
       case "session.usage.updated": {
+        // OpenCode reports the session's running totals; Limits records the increase and checks the caps.
         if (!sessionID) return;
-        const tokens = d.tokens as { input: number; output: number; reasoning: number; cache: { read: number; write: number } } | undefined;
+        const tokens = d.tokens as TokenTotals | undefined;
         const cost = typeof d.cost === "number" ? d.cost : 0;
         const at = typeof ev.created === "number" ? ev.created : Date.now();
-        store.recordSpend(`${sessionID}:${at}`, sessionID, cost, at);
+        const { breaches } = limits.recordUsage(sessionID, cost, tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, at);
         if (tokens) store.recordReasoningUsage(`session-${sessionID}`, tokens.input, tokens.output, tokens.reasoning, cost, at);
         tasks.onActivity(sessionID);
+        if (breaches.length) void handleBreaches(breaches).catch((err) => log.error("enforcing a spending cap failed", err));
         return;
       }
+      // OpenCode 2.0.32 sends permission.asked (the request itself) and form.created ({form}); the
+      // older names are kept so a server bump in either direction doesn't silently drop prompts.
+      case "permission.asked":
       case "permission.requested":
         await approvals.onPermissionAsked(d as unknown as Parameters<Approvals["onPermissionAsked"]>[0], directory);
         return;
+      case "form.created":
       case "form.requested":
-        await approvals.onFormRequested(d as unknown as Parameters<Approvals["onFormRequested"]>[0], directory);
+        await approvals.onFormRequested((d.form ?? d) as unknown as Parameters<Approvals["onFormRequested"]>[0], directory);
         return;
       case "permission.replied":
       case "form.replied":
       case "form.rejected":
-        if (typeof d.requestID === "string") await approvals.onReplied(d.requestID);
-        else if (typeof d.formID === "string") await approvals.onReplied(d.formID);
+      case "form.cancelled": {
+        const id = [d.requestID, d.formID, d.id].find((v): v is string => typeof v === "string");
+        if (id) await approvals.onReplied(id);
         return;
+      }
       case "session.step.ended":
       case "session.text.delta":
       case "session.reasoning.delta":
@@ -238,7 +372,7 @@ async function main() {
   scheduler.start();
   const media = buildMedia(cfg, cfg.TELEGRAM_BOT_TOKEN);
   if (media) log.info(`media pipeline: ${media.capabilities()}`);
-  registerHandlers(bot, { cfg, store, oc, conversation, tasks, approvals, scheduler, labelFor, ...(media ? { media } : {}) });
+  registerHandlers(bot, { cfg, store, oc, conversation, tasks, approvals, scheduler, labelFor, roles, limits, catalog, subagents, ...(media ? { media } : {}) });
   await bot.api.setMyCommands(COMMAND_MENU).catch((err) => log.warn(`could not set the command menu: ${(err as Error).message}`));
   bot.start({ onStart: (me) => log.info(`telegram bot @${me.username} is listening (owner ${cfg.OWNER_TELEGRAM_ID})`) }).catch((err) => {
     log.error("Telegram polling stopped (bad TELEGRAM_BOT_TOKEN, or another instance is polling the same bot)", err);
@@ -251,6 +385,7 @@ async function main() {
     stopping = true;
     log.info(`${signal}: shutting down`);
     abort.abort();
+    clearInterval(catalogTimer);
     scheduler?.stop();
     conversation.shutdown();
     await bot.stop().catch(() => {});

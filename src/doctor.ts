@@ -2,14 +2,18 @@
  * `npm run doctor`: checks the setup end to end without starting the Telegram bot
  * and without spending any model tokens. `--write` also test-creates a project repo.
  */
+import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { Catalog } from "./catalog.ts";
 import { loadConfig, parseModelRef } from "./config.ts";
 import { Store } from "./db.ts";
+import { Kinds, readPolicy } from "./kinds.ts";
 import { setLogLevel } from "./log.ts";
 import { startHqServer } from "./mcp.ts";
-import { OpenCode } from "./opencode.ts";
+import { entryName, OpenCode } from "./opencode.ts";
 import { crowbotBalance } from "./provider.ts";
+import { Roles } from "./roles.ts";
 import { Scheduler } from "./scheduler.ts";
 import { Tasks } from "./tasks.ts";
 
@@ -71,6 +75,9 @@ async function main() {
     process.exit(1);
   }
 
+  // Right after it starts, OpenCode answers with no agents or only its built-ins; wait for its config.
+  if (!(await new Kinds({ cfg, oc }).refresh())) warn("OpenCode's agent list still has no assistant agent after waiting; the checks below may be wrong");
+
   // Models in use: per-agent defaults from opencode.json, overridden by CHAT_MODEL / WORKER_MODEL.
   const inUse = new Map<string, string>();
   try {
@@ -103,6 +110,49 @@ async function main() {
     fail(`could not list models: ${(err as Error).message}`);
   }
 
+  console.log("Subagents and model routing");
+  {
+    try {
+      readPolicy(cfg.KINDS_FILE);
+      ok(`kind policy ${cfg.KINDS_FILE} is valid`);
+    } catch (err) {
+      if (fs.existsSync(cfg.KINDS_FILE)) fail((err as Error).message);
+      else warn(`no kind policy at ${cfg.KINDS_FILE}; every kind runs on the defaults`);
+    }
+    const doctorStore = new Store(":memory:");
+    const catalog = new Catalog({ cfg, store: doctorStore, oc });
+    const refreshed = await catalog.refresh();
+    if (refreshed.ok && catalog.hasCrowbot()) ok(`crowbot catalog: ${catalog.usable().length} usable models`);
+    else if (catalog.hasCrowbot()) warn(`catalog partly refreshed (${refreshed.error})`);
+    else warn(`no crowbot catalog (${refreshed.error ?? "CROWBOT_API_KEY unset"}); prices come from opencode.json`);
+    const drift = catalog.drift();
+    if (drift.missing.length) warn(`crowbot serves models OpenCode can't run yet: ${drift.missing.join(", ")} — run npm run models:sync`);
+    if (drift.prices.length) warn(`opencode.json prices differ from crowbot's for ${drift.prices.map((p) => p.id).join(", ")} — run npm run models:sync`);
+    const kinds = new Kinds({ cfg, oc });
+    await kinds.refresh();
+    const list = kinds.list();
+    if (list.length) ok(`subagent kinds: ${list.map((k) => k.id).join(", ")}`);
+    else warn("no subagent kinds (no agent with mode \"subagent\" in opencode.json), so hq_delegate is not offered");
+    for (const orphan of kinds.orphanPolicies()) warn(`config/kinds.json configures "${orphan}", but OpenCode has no such agent`);
+    for (const clash of kinds.reservedClashes()) warn(`agent "${clash}" uses a reserved role name and is ignored as a kind`);
+    const roles = new Roles({ cfg, store: doctorStore, catalog, kinds });
+    for (const id of roles.ids()) {
+      const line = roles.describe(id);
+      if (line.startsWith("⚠️")) fail(`${id}: ${line.slice(3)}`);
+      else ok(`${id} → ${line}`);
+    }
+    doctorStore.close();
+    const ocConfig = path.resolve("opencode/opencode.json");
+    if (fs.existsSync(ocConfig)) {
+      const c = JSON.parse(fs.readFileSync(ocConfig, "utf8")) as { tools?: Record<string, boolean>; mcp?: { hq?: { timeout?: number } } };
+      if (c.tools?.task !== false) fail('opencode.json: set "tools": {"task": false} so OpenCode\'s own subagent tool can\'t bypass the gateway');
+      else ok("OpenCode's own subagent tool is off");
+      const timeout = c.mcp?.hq?.timeout ?? 0;
+      if (timeout < (cfg.SUBAGENT_SYNC_SEC + 15) * 1000) fail(`opencode.json: mcp.hq.timeout is ${timeout} ms; it must exceed SUBAGENT_SYNC_SEC (${cfg.SUBAGENT_SYNC_SEC}s) or delegations time out`);
+      else ok(`hq tool timeout ${timeout / 1000}s covers the ${cfg.SUBAGENT_SYNC_SEC}s delegation window`);
+    }
+  }
+
   if (cfg.CROWBOT_API_KEY) {
     try {
       ok(`crowbot account works, balance $${(await crowbotBalance(cfg.CROWBOT_API_KEY)).balanceUsd.toFixed(2)}`);
@@ -112,7 +162,7 @@ async function main() {
   } else warn("CROWBOT_API_KEY isn't set for the gateway, so /cost can't show the balance");
 
   try {
-    const entries = (await oc.listDir(cfg.ASSISTANT_HOME)).map((e) => e.name ?? e.path.split(/[\\/]/).pop());
+    const entries = (await oc.listDir(cfg.ASSISTANT_HOME)).map((e) => entryName(e));
     if (entries.includes("AGENTS.md") && entries.includes("memory")) ok(`assistant home looks right (${entries.length} entries)`);
     else warn(`assistant home ${cfg.ASSISTANT_HOME} has no AGENTS.md/memory — seed it from home/`);
   } catch (err) {

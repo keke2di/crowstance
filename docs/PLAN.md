@@ -163,6 +163,22 @@ Each milestone is independently shippable after its exit criteria and tests pass
 
 **Exit:** operators can see degradation before silent loss, restore a representative state backup, and follow documented upgrade, rollback, incident, privacy, and recovery procedures.
 
+### M9. Gateway-owned subagents, model routing and hard spend caps
+
+**Goal:** the chat hands focused jobs to subagent *kinds* through `hq_delegate`; each kind has its own job, tools, model and effort, with a default for all subagents (the crowbot-cli shape: call → your pick for the kind → its config → your pick for all → `every` → the chat). The gateway checks every model against crowbot's live catalog, enforces hard spend caps, and discovers the kinds from OpenCode. Only the main chat delegates; subagents can't nest. See `docs/SUBAGENTS.md`. (A first version picked models by price tiers; it was replaced because tiers hid what each kind actually ran on.)
+
+**File-level changes:** new `src/catalog.ts`, `src/kinds.ts`, `src/roles.ts`, `src/limits.ts`, `src/subagents.ts`, `src/errors.ts`, `config/kinds.json`, `scripts/models-sync.ts`, `opencode/prompts/subagents/*.md`; migration v9 (`session_costs`, `subagent_runs`, `tasks.model_from`); `hq_delegate` in `src/mcp.ts`; `/model` roles card and `/limits` in `src/telegram/bot.ts`; event wiring and cap enforcement in `src/index.ts`; `subagent` agents, `"task": false` and a 150 s `hq` timeout in `opencode/opencode.json`; doctor checks.
+
+**Verified against OpenCode 2.0.32 first (2026-10-24):** an agent's configured `model` is ignored (sessions use the global model unless one is set at creation or via `/model`); `session.usage.updated` carries running totals; `limit` with `order=asc` returns the *oldest* messages; MCP tools are called through Code Mode (`execute`) and the `hq` timeout is enforced; the built-in task tool is `subagent` and `"task": false` removes it; right after a restart `/api/agent` is empty, then lists only built-in agents; OpenCode caches an MCP server's tool list from when it connected (reconnect to refresh); `/api/model` returns `cost` as a list of price tiers.
+
+**Fixed on the way:** spend was overcounted (running totals summed); worker reports and chat replies read the first page of long sessions; the configured assistant/worker models were never sent; a worker whose last step was tool calls reported nothing; most requests ignored their directory (v2 reads `location[directory]`), which broke worker repo creation; permission and question prompts never reached Telegram (v2 sends `permission.asked` and `form.created`), so a turn could block forever; single-choice answers were sent as lists and rejected; the watchdog called a session idle mid-run (the inbox empties on delivery); `/stop` showed an error.
+
+**Tests:** catalog intersection, drift, cache-on-failure and fallback; resolver order (kind → all subagents → chat), effort inheritance, price ceiling, no silent fallback, effort dropping; kind tools from opencode.json; cap clamping, floor, preflight, running-total accounting, catalog-priced increase, task/call/turn/daily breaches; delegation happy path, last-text answer, detach-to-update, limits, cap stop with partial answer, failure, restart recovery; `hq_delegate` description; adapter wire format (desc+reverse, child session model/variant).
+
+**Exit:** a delegation runs on its kind's model with its effort, is refused or interrupted at every cap, and its cost shows per kind; `/model` shows and changes the model of the chat, all subagents, each kind and the workers.
+
+**Ceilings:** a model new to crowbot is usable only after `npm run models:sync` and a deploy with `--restart-opencode`; a kind's tools are read from `opencode/opencode.json`, so an agent defined elsewhere (a built-in, an agent file) is listed without them; caps act on usage events, so one model step can overshoot a cap before the interrupt lands.
+
 ## Risk register
 
 | Risk | Impact | Detection / mitigation |

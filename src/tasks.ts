@@ -8,17 +8,23 @@ import crypto from "node:crypto";
 import type { Config } from "./config.ts";
 import { parseModelRef } from "./config.ts";
 import { KEY_DISK_LOW, type Store, type TaskRow, type TaskState } from "./db.ts";
+import { UserError } from "./errors.ts";
+import type { Limits } from "./limits.ts";
 import { logger } from "./log.ts";
-import { errorText, isAssistant, messageText, type OpenCode } from "./opencode.ts";
+import { errorText, isAbortError, isAssistant, lastReply, messageText, type ModelRef, type OpenCode } from "./opencode.ts";
+import type { Roles } from "./roles.ts";
 import { ago, duration, parseOutcome, slugify, stamp, startOfLocalDay, tail, truncate, usd } from "./text.ts";
 import { reserveReasoning } from "./reasoning.ts";
 
 const log = logger("tasks");
 
-export const KEY_WORKER_MODEL = "model.worker";
+export { KEY_WORKER_MODEL } from "./roles.ts";
+export { UserError } from "./errors.ts";
 
-/** Errors whose message should be shown to the assistant/user verbatim. */
-export class UserError extends Error {}
+/** Effort recorded on a task row: "default"/"max" are older rows' "no explicit effort". */
+function effortOf(t: Pick<TaskRow, "reasoning_variant">): string | undefined {
+  return t.reasoning_variant && t.reasoning_variant !== "default" && t.reasoning_variant !== "max" ? t.reasoning_variant : undefined;
+}
 
 export function isInside(child: string, parent: string): boolean {
   const rel = path.relative(parent, child);
@@ -47,18 +53,46 @@ export class Tasks {
   private readonly lastTouch = new Map<string, number>();
   private readonly lastError = new Map<string, string>();
   private readonly idleLocks = new Map<string, Promise<void>>();
+  private roles?: Roles;
+  private limits?: Limits;
 
-  constructor(deps: { cfg: Config; store: Store; oc: OpenCode; onUpdate: () => void; onStuck?: (task: TaskRow, idleFor: string) => void }) {
+  constructor(deps: { cfg: Config; store: Store; oc: OpenCode; onUpdate: () => void; onStuck?: (task: TaskRow, idleFor: string) => void; roles?: Roles; limits?: Limits }) {
     this.cfg = deps.cfg;
     this.store = deps.store;
     this.oc = deps.oc;
     this.onUpdate = deps.onUpdate;
     this.onStuck = deps.onStuck;
+    this.roles = deps.roles;
+    this.limits = deps.limits;
   }
 
-  workerModel(override?: string) {
-    const ref = override ?? this.store.get(KEY_WORKER_MODEL) ?? this.cfg.WORKER_MODEL;
-    return ref ? parseModelRef(ref) : undefined;
+  /** Wired after construction (the composition root builds roles from pieces that need Tasks). */
+  attach(deps: { roles?: Roles; limits?: Limits }) {
+    if (deps.roles) this.roles = deps.roles;
+    if (deps.limits) this.limits = deps.limits;
+  }
+
+  /** The model (and effort) a new worker runs on, and where that came from. Throws on a model that isn't allowed. */
+  workerModel(asked?: string): { ref: string | null; model?: ModelRef; effort?: string; from: string | null } {
+    if (this.roles) {
+      const r = this.roles.resolve("workers", asked);
+      return { ref: r.ref ?? null, ...(r.model ? { model: r.model } : {}), ...(r.effort ? { effort: r.effort } : {}), from: r.from };
+    }
+    const ref = asked ?? this.store.get("model.worker") ?? this.cfg.WORKER_MODEL ?? null;
+    return { ref, ...(ref ? { model: parseModelRef(ref) } : {}), from: null };
+  }
+
+  /** Validate a worker model without starting anything (scheduled jobs check theirs up front). */
+  checkModel(ref: string | undefined) {
+    if (ref) this.workerModel(ref);
+  }
+
+  private budgetCheck() {
+    if (this.limits) return this.limits.preflight("worker");
+    const spent = this.store.spendSince(startOfLocalDay());
+    if (spent >= this.cfg.DAILY_BUDGET_USD) {
+      throw new UserError(`Daily budget reached (${usd(spent)} of ${usd(this.cfg.DAILY_BUDGET_USD)}). Ask the user before starting more work; they can raise DAILY_BUDGET_USD.`);
+    }
   }
 
   /** "scraper", "~/projects/scraper" or an absolute path inside PROJECTS_DIR → absolute directory. */
@@ -94,10 +128,8 @@ export class Tasks {
     if (this.store.get(KEY_DISK_LOW) === "1") {
       throw new UserError("The server is low on disk space, so new tasks are paused. Free some space first (the user has been told).");
     }
-    const spent = this.store.spendSince(startOfLocalDay());
-    if (spent >= this.cfg.DAILY_BUDGET_USD) {
-      throw new UserError(`Daily budget reached (${usd(spent)} of ${usd(this.cfg.DAILY_BUDGET_USD)}). Ask the user before starting more work; they can raise DAILY_BUDGET_USD.`);
-    }
+    this.budgetCheck();
+    const chosen = this.workerModel(p.model);
     const directory = this.resolveProjectDir(p.project ?? p.title);
     const token = crypto.randomUUID();
     const base = slugify(p.title, 32);
@@ -109,21 +141,22 @@ export class Tasks {
     if (!slug) throw new UserError(`Already running ${this.cfg.MAX_WORKERS} tasks; the limit is ${this.cfg.MAX_WORKERS}. Wait for one to finish or stop one.`);
     try {
       await this.oc.ensureGitRepo(directory, this.cfg.PROJECTS_DIR);
-      const session = await this.oc.createSession({ directory, title: `task: ${p.title}`, agent: this.cfg.WORKER_AGENT, metadata: { hq: { kind: "worker", slug } } });
-      const modelRef = p.model ?? this.store.get(KEY_WORKER_MODEL) ?? this.cfg.WORKER_MODEL ?? null;
+      const session = await this.oc.createSession({ directory, title: `task: ${p.title}`, agent: this.cfg.WORKER_AGENT, metadata: { hq: { kind: "worker", slug } }, ...(chosen.model ? { model: chosen.model } : {}) });
+      const modelRef = chosen.ref;
       reserveReasoning(this.store, this.cfg, `task-${slug}-${Date.now()}`, session.id, p.job ? "scheduled-worker" : "worker", p.brief);
       const row = this.store.insertTask({
-      slug,
-      title: p.title,
-      brief: p.brief,
-      directory,
-      session_id: session.id,
-      state: "running",
-       model: modelRef,
-       reasoning_variant: "default",
-      job: p.job ?? null,
-      created_at: Date.now(),
-    });
+        slug,
+        title: p.title,
+        brief: p.brief,
+        directory,
+        session_id: session.id,
+        state: "running",
+        model: modelRef,
+        reasoning_variant: chosen.effort ?? "default",
+        model_from: chosen.from,
+        job: p.job ?? null,
+        created_at: Date.now(),
+      });
       this.store.releaseTaskReservation(token);
 
       const text = [
@@ -137,7 +170,7 @@ export class Tasks {
         sessionID: session.id,
         directory,
         agent: this.cfg.WORKER_AGENT,
-        model: modelRef ? parseModelRef(modelRef) : undefined,
+        model: chosen.model,
         parts: [{ type: "text", text }],
       });
       } catch (err) {
@@ -157,7 +190,10 @@ export class Tasks {
     let resumeToken: string | undefined;
     if (t.state !== "running") {
       if (this.store.get(KEY_DISK_LOW) === "1") throw new UserError("The server is low on disk space, so this task cannot be resumed yet.");
-      if (this.store.spendSince(startOfLocalDay()) >= this.cfg.DAILY_BUDGET_USD) throw new UserError("Daily budget reached; this task cannot be resumed.");
+      this.budgetCheck();
+      if (this.limits && this.store.sessionSpend(t.session_id) >= this.limits.get("task")) {
+        throw new UserError(`Task ${t.slug} already cost ${usd(this.store.sessionSpend(t.session_id))}, its cap (/limits task); start a new task instead.`);
+      }
       resumeToken = crypto.randomUUID();
       if (!this.store.reserveTask(resumeToken, `${t.slug}-resume-${Date.now()}`, t.directory, this.cfg.MAX_WORKERS, t.slug)) throw new UserError(`The worker limit is ${this.cfg.MAX_WORKERS}; wait for capacity before resuming.`);
     }
@@ -166,7 +202,7 @@ export class Tasks {
       sessionID: t.session_id,
       directory: t.directory,
       agent: this.cfg.WORKER_AGENT,
-      model: t.model ? parseModelRef(t.model) : undefined,
+      model: t.model ? { ...parseModelRef(t.model), ...(effortOf(t) ? { variant: effortOf(t) } : {}) } : undefined,
       parts: [{ type: "text", text: `[Message from the user, relayed by the assistant · ${stamp()}]\n${text}` }],
     }); } catch (err) { if (resumeToken) this.store.releaseTaskReservation(resumeToken); throw err; }
     if (resumeToken) this.store.releaseTaskReservation(resumeToken);
@@ -188,6 +224,24 @@ export class Tasks {
     return t;
   }
 
+  /** A task reached its cost cap: stop it and tell the assistant why. */
+  async stopForCap(sessionID: string, reason: string) {
+    const t = this.store.taskBySession(sessionID);
+    if (!t || (t.state !== "running" && t.state !== "waiting")) return;
+    await this.stop(t.slug);
+    this.store.updateTaskAndEnqueue(t.slug, { last_report: `Stopped: ${reason}` }, "task", `Task ${t.slug} ("${t.title}") was stopped: ${reason}. Its work so far is in ${t.directory}.`, true);
+    this.onUpdate();
+  }
+
+  /** A daily or monthly cap tripped: stop every running worker. */
+  async stopAll(reason: string) {
+    for (const t of this.store.activeTasks()) {
+      if (t.state !== "running") continue;
+      await this.stop(t.slug);
+      this.store.updateTask(t.slug, { last_report: `Stopped: ${reason}` });
+    }
+  }
+
   /** One line per task plus a short detail block for anything running: what /tasks shows. */
   async list(includeFinishedHours = 24): Promise<string> {
     const tasks = this.store.recentTasks(Date.now() - includeFinishedHours * 3_600_000);
@@ -199,10 +253,12 @@ export class Tasks {
           this.oc.getSession(t.session_id, t.directory).catch(() => undefined),
         ]);
         const pending = this.store.openApprovals().filter((a) => a.session_id === t.session_id).length;
+        const spent = Math.max(this.store.sessionSpend(t.session_id), session?.cost ?? 0);
         const bits = [
           describeState(t, live),
           t.state === "running" || t.state === "waiting" ? `for ${duration(Date.now() - t.created_at)}` : `${ago(t.updated_at)}`,
-          session ? usd(session.cost ?? 0) : undefined,
+          session || spent ? usd(spent) : undefined,
+          t.model ? `on ${t.model}` : undefined,
           t.state === "running" ? `last activity ${ago(t.last_activity_at)}` : undefined,
           pending > 0 ? `⚠️ waiting on your approval` : undefined,
         ].filter(Boolean);
@@ -227,7 +283,8 @@ export class Tasks {
       `State: ${describeState(t, live)}`,
       `Started ${ago(t.created_at)}; last activity ${ago(t.last_activity_at)}; directory ${t.directory}`,
     ];
-    if (session) lines.push(`Cost so far: ${usd(session.cost ?? 0)}`);
+    if (session) lines.push(`Cost so far: ${usd(Math.max(this.store.sessionSpend(t.session_id), session.cost ?? 0))}${this.limits ? ` (cap ${usd(this.limits.get("task"))})` : ""}`);
+    if (t.model) lines.push(`Model: ${t.model}${effortOf(t) ? `, effort ${effortOf(t)}` : ""}${t.model_from ? ` (${t.model_from})` : ""}`);
     for (const a of pending) {
       const payload = JSON.parse(a.payload) as { action?: string; resources?: string[]; permission?: string; patterns?: string[]; fields?: { title?: string; key: string }[] };
       lines.push(
@@ -281,7 +338,7 @@ export class Tasks {
     const e = error as { type?: string; name?: string; message?: string; data?: { message?: string } } | undefined;
     if (!e) return;
     const text = `${e.type ?? e.name ?? "Error"}${e.message ? `: ${e.message}` : e.data?.message ? `: ${e.data.message}` : ""}`;
-    if (text.startsWith("MessageAbortedError")) return;
+    if (isAbortError(text)) return;
     this.lastError.set(sessionID, text);
   }
 
@@ -299,13 +356,14 @@ export class Tasks {
     if (t.state === "finished" || t.state === "waiting") return; // already reported
 
     const msgs = await this.oc.messages(sessionID, t.directory, 10);
+    // The report is the last words the worker wrote; a final step of tool calls alone has none.
+    const { text: report } = lastReply(msgs);
     const last = msgs.filter((m) => isAssistant(m)).at(-1);
-    const report = last ? messageText(last) : "";
     const error = this.lastError.get(sessionID) ?? (last ? errorText(last) : undefined);
     this.lastError.delete(sessionID);
 
     let reported: { state: TaskState; outcome?: string };
-    if (error && !error.startsWith("MessageAbortedError")) {
+    if (error && !isAbortError(error)) {
       reported = { state: "failed" };
       this.store.transitionTaskAndEnqueue(t.slug, "running", { state: "failed", last_report: `${error}\n\n${report}`.trim(), finished_at: Date.now() }, "task", `Task ${t.slug} ("${t.title}") failed: ${truncate(error, 300)}${report ? `\nLast words: ${tail(report, 600)}` : ""}`);
     } else {

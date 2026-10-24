@@ -17,9 +17,18 @@
         "stub-model": {
           "name": "Local development stub",
           "limit": {"context": 32768, "output": 4096},
-          "cost": {"input": 0, "output": 0, "cache_read": 0},
-          "tool_call": false,
-          "reasoning": false,
+          "cost": {"input": 1, "output": 2, "cache_read": 0.1},
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": true,
+          "attachment": false
+        },
+        "stub-cheap": {
+          "name": "Local development stub (cheap)",
+          "limit": {"context": 32768, "output": 4096},
+          "cost": {"input": 0.1, "output": 0.2, "cache_read": 0.01},
+          "tool_call": true,
+          "reasoning": true,
           "temperature": true,
           "attachment": false
         }
@@ -32,10 +41,10 @@
       "url": "http://127.0.0.1:{env:HQ_PORT}/mcp",
       "headers": {"Authorization": "Bearer {env:HQ_MCP_TOKEN}"},
       "oauth": false,
-      "timeout": 15000
+      "timeout": 150000
     }
   },
-  "tools": {"hq_*": false},
+  "tools": {"hq_*": false, "task": false},
   "agent": {
     "assistant": {
       "description": "Personal assistant you talk to over Telegram",
@@ -49,6 +58,24 @@
       "mode": "primary",
       "prompt": "{file:./prompts/worker.md}",
       "model": "stub/stub-model"
+    },
+    "explore": {
+      "description": "Finds things and reports them: searches and reads files and the web, changes nothing.",
+      "mode": "subagent",
+      "prompt": "{file:./prompts/subagents/explore.md}",
+      "tools": {"edit": false, "write": false, "bash": false, "question": false, "execute": false}
+    },
+    "research": {
+      "description": "Researches a question across several web sources and returns a short, cited summary. Changes nothing.",
+      "mode": "subagent",
+      "prompt": "{file:./prompts/subagents/research.md}",
+      "tools": {"edit": false, "write": false, "bash": false, "question": false, "execute": false}
+    },
+    "analyst": {
+      "description": "Thinks hard about one question, plan, document or piece of code and gives a reasoned answer or review. Changes nothing.",
+      "mode": "subagent",
+      "prompt": "{file:./prompts/subagents/analyst.md}",
+      "tools": {"edit": false, "write": false, "bash": false, "question": false, "execute": false}
     }
   },
   "permission": {

@@ -26,9 +26,35 @@ export type TaskRow = {
   stuck_notified: number;
   abort_state: "none" | "requested" | "confirmed" | "failed";
   reasoning_variant: string;
+  /** Where the task's model came from (roles.ts source label). */
+  model_from: string | null;
 };
 
-export type UpdateKind = "task" | "reminder" | "job" | "notify" | "checkin" | "system";
+export type SubagentState = "running" | "done" | "failed" | "capped" | "stopped" | "timeout";
+export type SubagentRunRow = {
+  id: number;
+  parent_session: string;
+  turn_id: number | null;
+  kind: string;
+  session_id: string | null;
+  prompt: string;
+  model: string | null;
+  effort: string | null;
+  model_from: string | null;
+  state: SubagentState;
+  /** 1 once the delegating call stopped waiting; the result then arrives as an update. */
+  detached: number;
+  started_at: number;
+  finished_at: number | null;
+  result: string | null;
+  error: string | null;
+};
+
+/** Cumulative token counts OpenCode reports for a session. */
+export type TokenTotals = { input: number; output: number; reasoning: number; cache: { read: number; write: number } };
+export type SessionCostRow = { session_id: string; oc_cost: number; tokens: string; cost: number; updated_at: number };
+
+export type UpdateKind = "task" | "reminder" | "job" | "notify" | "checkin" | "system" | "subagent";
 export type UpdateRow = {
   id: number;
   created_at: number;
@@ -112,9 +138,10 @@ export type RetentionPolicy = {
   approvalsBefore?: number;
   turnsBefore?: number;
   attemptsBefore?: number;
+  subagentsBefore?: number;
 };
 
-export type RetentionResult = { updates: number; inbound: number; outbound: number; approvals: number; turns: number; attempts: number };
+export type RetentionResult = { updates: number; inbound: number; outbound: number; approvals: number; turns: number; attempts: number; subagents: number };
 
 export class Store {
   readonly db: Database.Database;
@@ -146,14 +173,14 @@ export class Store {
   }
 
   // ---- tasks ----
-  insertTask(t: Omit<TaskRow, "id" | "updated_at" | "finished_at" | "last_report" | "stuck_notified" | "outcome" | "last_activity_at" | "abort_state" | "reasoning_variant"> & { reasoning_variant?: string }) {
+  insertTask(t: Omit<TaskRow, "id" | "updated_at" | "finished_at" | "last_report" | "stuck_notified" | "outcome" | "last_activity_at" | "abort_state" | "reasoning_variant" | "model_from"> & { reasoning_variant?: string; model_from?: string | null }) {
     const now = t.created_at;
     this.db
       .prepare(
-         `INSERT INTO tasks (slug, title, brief, directory, session_id, state, model, job, reasoning_variant, created_at, updated_at, last_activity_at)
-          VALUES (@slug, @title, @brief, @directory, @session_id, @state, @model, @job, COALESCE(@reasoning_variant, 'max'), @created_at, @now, @now)`,
+         `INSERT INTO tasks (slug, title, brief, directory, session_id, state, model, job, reasoning_variant, model_from, created_at, updated_at, last_activity_at)
+          VALUES (@slug, @title, @brief, @directory, @session_id, @state, @model, @job, COALESCE(@reasoning_variant, 'max'), @model_from, @created_at, @now, @now)`,
       )
-      .run({ reasoning_variant: t.reasoning_variant ?? null, ...t, now });
+      .run({ reasoning_variant: t.reasoning_variant ?? null, ...t, model_from: t.model_from ?? null, now });
     return this.taskBySlug(t.slug)!;
   }
 
@@ -439,6 +466,108 @@ export class Store {
       .all(sinceMs) as { session_id: string; total: number }[];
   }
 
+  /** What subagent sessions cost since `sinceMs`, per kind. */
+  subagentSpendByKindSince(sinceMs: number) {
+    return this.db
+      .prepare(
+        `SELECT r.kind AS kind, SUM(s.cost) AS total FROM spend s JOIN subagent_runs r ON r.session_id = s.session_id
+         WHERE s.completed_at >= ? GROUP BY r.kind ORDER BY total DESC`,
+      )
+      .all(sinceMs) as { kind: string; total: number }[];
+  }
+
+  subagentSpendSince(sinceMs: number): number {
+    const row = this.db
+      .prepare("SELECT COALESCE(SUM(s.cost), 0) AS total FROM spend s JOIN subagent_runs r ON r.session_id = s.session_id WHERE s.completed_at >= ?")
+      .get(sinceMs) as { total: number };
+    return row.total;
+  }
+
+  // ---- per-session running totals (OpenCode reports usage cumulatively) ----
+  sessionCost(sessionID: string) {
+    return this.db.prepare("SELECT * FROM session_costs WHERE session_id = ?").get(sessionID) as SessionCostRow | undefined;
+  }
+
+  /**
+   * Store a session's new running totals and record the increase as spend, in one transaction.
+   * `price` turns the token increase into dollars (crowbot's catalog prices); the recorded increase
+   * is the larger of that and OpenCode's own cost increase, so a stale price never undercounts.
+   */
+  recordSessionUsage(sessionID: string, ocTotal: number, tokens: TokenTotals, at: number, price?: (delta: TokenTotals) => number | undefined) {
+    return this.db.transaction(() => {
+      const prev = this.sessionCost(sessionID);
+      const before = prev ? (JSON.parse(prev.tokens) as Partial<TokenTotals>) : {};
+      const delta: TokenTotals = {
+        input: Math.max(0, tokens.input - (before.input ?? 0)),
+        output: Math.max(0, tokens.output - (before.output ?? 0)),
+        reasoning: Math.max(0, tokens.reasoning - (before.reasoning ?? 0)),
+        cache: { read: Math.max(0, tokens.cache.read - (before.cache?.read ?? 0)), write: Math.max(0, tokens.cache.write - (before.cache?.write ?? 0)) },
+      };
+      const ocDelta = Math.max(0, ocTotal - (prev?.oc_cost ?? 0));
+      const increase = Math.max(ocDelta, price?.(delta) ?? 0);
+      const total = (prev?.cost ?? 0) + increase;
+      this.db
+        .prepare(
+          `INSERT INTO session_costs (session_id, oc_cost, tokens, cost, updated_at) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET oc_cost = excluded.oc_cost, tokens = excluded.tokens, cost = excluded.cost, updated_at = excluded.updated_at`,
+        )
+        .run(sessionID, Math.max(ocTotal, prev?.oc_cost ?? 0), JSON.stringify(tokens), total, at);
+      if (increase > 0) this.recordSpend(`${sessionID}:${at}`, sessionID, increase, at);
+      return { increase, total, tokens: delta };
+    })();
+  }
+
+  // ---- subagent runs ----
+  insertSubagentRun(r: Pick<SubagentRunRow, "parent_session" | "turn_id" | "kind" | "prompt" | "model" | "effort" | "model_from">) {
+    const info = this.db
+      .prepare(
+        `INSERT INTO subagent_runs (parent_session, turn_id, kind, prompt, model, effort, model_from, started_at)
+         VALUES (@parent_session, @turn_id, @kind, @prompt, @model, @effort, @model_from, @now)`,
+      )
+      .run({ ...r, now: Date.now() });
+    return this.subagentRun(Number(info.lastInsertRowid))!;
+  }
+
+  subagentRun(id: number) {
+    return this.db.prepare("SELECT * FROM subagent_runs WHERE id = ?").get(id) as SubagentRunRow | undefined;
+  }
+
+  subagentRunBySession(sessionID: string) {
+    return this.db.prepare("SELECT * FROM subagent_runs WHERE session_id = ?").get(sessionID) as SubagentRunRow | undefined;
+  }
+
+  runningSubagents() {
+    return this.db.prepare("SELECT * FROM subagent_runs WHERE state = 'running' ORDER BY started_at").all() as SubagentRunRow[];
+  }
+
+  recentSubagents(sinceMs: number) {
+    return this.db.prepare("SELECT * FROM subagent_runs WHERE state = 'running' OR started_at >= ? ORDER BY started_at").all(sinceMs) as SubagentRunRow[];
+  }
+
+  subagentsInTurn(turnID: number) {
+    return this.db.prepare("SELECT * FROM subagent_runs WHERE turn_id = ? ORDER BY started_at").all(turnID) as SubagentRunRow[];
+  }
+
+  updateSubagentRun(id: number, patch: Partial<Omit<SubagentRunRow, "id">>) {
+    const fields = Object.keys(patch);
+    if (fields.length === 0) return;
+    this.db.prepare(`UPDATE subagent_runs SET ${fields.map((f) => `${f} = @${f}`).join(", ")} WHERE id = @__id`).run({ ...patch, __id: id });
+  }
+
+  /** Move a running delegation to a final state; false if something else already finished it. */
+  finishSubagentRun(id: number, state: Exclude<SubagentState, "running">, patch: { result?: string | null; error?: string | null } = {}) {
+    return (
+      this.db
+        .prepare("UPDATE subagent_runs SET state = ?, finished_at = ?, result = COALESCE(?, result), error = COALESCE(?, error) WHERE id = ? AND state = 'running'")
+        .run(state, Date.now(), patch.result ?? null, patch.error ?? null, id).changes > 0
+    );
+  }
+
+  /** Spend recorded against one session (since it started). */
+  sessionSpend(sessionID: string): number {
+    return this.sessionCost(sessionID)?.cost ?? 0;
+  }
+
   reserveReasoning(requestID: string, sessionID: string, scope: string, variant: string, estimatedCost: number) {
     this.db.prepare("INSERT OR IGNORE INTO reasoning_usage(request_id,session_id,scope,variant,estimated_cost,created_at) VALUES(?,?,?,?,?,?)").run(requestID, sessionID, scope, variant, estimatedCost, Date.now());
   }
@@ -496,7 +625,7 @@ export class Store {
    * approvals and unfired reminders are never touched.
    */
   applyRetention(policy: RetentionPolicy): RetentionResult {
-    const result: RetentionResult = { updates: 0, inbound: 0, outbound: 0, approvals: 0, turns: 0, attempts: 0 };
+    const result: RetentionResult = { updates: 0, inbound: 0, outbound: 0, approvals: 0, turns: 0, attempts: 0, subagents: 0 };
     this.db.transaction(() => {
       if (policy.updatesBefore !== undefined) {
         result.updates = this.db.prepare("DELETE FROM updates WHERE delivered_at IS NOT NULL AND delivered_at < ?").run(policy.updatesBefore).changes;
@@ -522,6 +651,9 @@ export class Store {
       }
       if (policy.turnsBefore !== undefined) {
         result.turns = this.db.prepare("DELETE FROM turns WHERE state IN ('done','failed') AND completed_at IS NOT NULL AND completed_at < ?").run(policy.turnsBefore).changes;
+      }
+      if (policy.subagentsBefore !== undefined) {
+        result.subagents = this.db.prepare("DELETE FROM subagent_runs WHERE state != 'running' AND finished_at IS NOT NULL AND finished_at < ?").run(policy.subagentsBefore).changes;
       }
     })();
     return result;

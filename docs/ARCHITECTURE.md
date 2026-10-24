@@ -51,7 +51,9 @@ Key tables:
 | `approval_snapshots` | successful-snapshot watermarks so an outage never expires a real request |
 | `reminders` | one-off reminders |
 | `jobs` / `monitors` | cron jobs and cheap interval scripts |
-| `spend` / `reasoning_usage` | model cost accounting |
+| `spend` / `reasoning_usage` | model cost accounting (spend rows are increases, never running totals) |
+| `session_costs` | each session's last running usage total from OpenCode, so only the increase is recorded |
+| `subagent_runs` | one row per `hq_delegate` call: kind, model, effort and its origin, state, answer |
 
 ### Delivery policy
 
@@ -74,6 +76,34 @@ outbound event is durably recorded.
 4. On idle, completed assistant text is selected via a durable watermark, enqueued as an
    `outbound_event` (same correlation id), and the delivery worker sends it to Telegram.
 5. `NO_REPLY` suppresses a turn's output. Errors become a visible `⚠️` message.
+
+During a turn the assistant can call `hq_delegate`: the gateway starts a child session of the
+main session for a subagent kind, on the model and effort `src/roles.ts` resolves from crowbot's
+catalog, and returns its answer as the tool result. Every session's usage events feed
+`src/limits.ts`, which records the cost increase and interrupts whatever breaks a cap. See
+`SUBAGENTS.md`.
+
+## OpenCode 2 behaviour the gateway relies on
+
+Verified against a live 2.0.32 server (2026-10-24), not taken from its docs. Each item is handled
+in `src/opencode.ts` or noted where it is used; check them again on a server bump.
+
+| Behaviour | Consequence |
+|---|---|
+| An agent's configured `model` is ignored; a session runs on the global `model` | The gateway sends the model (and effort, as `variant`) at session creation and on every prompt |
+| Most routes scope by `location[directory]`; only `GET /api/session` reads `directory` | Both are sent; a missing one silently falls back to OpenCode's working directory |
+| `session.usage.updated` carries the session's running totals | `session_costs` keeps the last total; spend records only the increase |
+| Messages with `limit` + `order=asc` are the *oldest* page | Reads ask for `desc` and reverse |
+| The inbox empties once a prompt is delivered | Busy/idle comes from the newest message (an `idle` entry, or a finished assistant message) |
+| Prompts arrive as `permission.asked` (the request itself) and `form.created` (`{form}`); replies as `permission.replied` (`requestID`) and `form.replied` (`id`) | Dispatched in `src/index.ts`; a 3-minute sweep of `GET /api/form` and pending permissions catches any missed event |
+| A denied permission interrupts the whole run (`session.execution.interrupted`, error `aborted`) | Treated as an interrupt, not an error |
+| A single-choice form field takes a string; only `multiselect` takes a list | `Approvals.tapOption` sends the value itself |
+| MCP tools are reached through Code Mode (`execute` → `tools.hq.<tool>`), and the `hq` `timeout` is enforced | `hq` timeout (150 s) exceeds `SUBAGENT_SYNC_SEC` |
+| OpenCode lists an MCP server's tools when it connects and keeps that list | The gateway reconnects `hq` when the subagent kinds change |
+| Right after a start, `/api/agent` is empty, then lists only built-ins | Kind discovery retries until the assistant agent is listed |
+| The built-in subagent tool is `subagent` and is on by default | `"tools": {"task": false}` turns it off so all delegation goes through the gateway |
+| `/api/model` gives `cost` as a list of price tiers and offers low/medium/high variants for every model | Read by `src/catalog.ts`; effort needs no config |
+| Directory listings end directory names with a separator (`memory/`, `memory\`) | `entryName` strips it (worker repo creation depends on it) |
 
 ## Observability
 

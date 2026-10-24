@@ -6,6 +6,10 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { describe, expect, it, afterEach } from "vitest";
 
+// These suites run the real deploy scripts: bash, symlinks, file modes and systemd-style layouts.
+// They target the Linux server, so they run on Linux (and CI) and are skipped on Windows.
+const linuxOnly = describe.skipIf(process.platform === "win32");
+
 const run = promisify(execFile);
 async function runChecked(file: string, args: string[], options: Parameters<typeof execFile>[2]) {
   try {
@@ -28,7 +32,7 @@ afterEach(async () => {
   await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-describe("deployment security boundaries", () => {
+linuxOnly("deployment security boundaries", () => {
   it("renders units with backup isolation and netguard ordering", async () => {
     const backup = await readFile(join(repo, "deploy/systemd/crowstance-backup.service"), "utf8");
     const opencode = await readFile(join(repo, "deploy/systemd/crowstance-opencode.service"), "utf8");

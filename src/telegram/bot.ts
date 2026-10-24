@@ -2,14 +2,19 @@ import { autoRetry } from "@grammyjs/auto-retry";
 import { Bot, InlineKeyboard, type Context } from "grammy";
 import type { Message } from "grammy/types";
 import type { Approvals } from "../approvals.ts";
+import { priceLabel, type Catalog } from "../catalog.ts";
 import type { Config } from "../config.ts";
-import { KEY_CHAT_MODEL, type Conversation } from "../conversation.ts";
+import type { Conversation } from "../conversation.ts";
 import type { Store } from "../db.ts";
+import { EFFORTS } from "../kinds.ts";
+import { isCapName, type Limits } from "../limits.ts";
 import { logger } from "../log.ts";
 import type { OpenCode } from "../opencode.ts";
 import { crowbotBalance } from "../provider.ts";
+import type { Roles } from "../roles.ts";
 import { KEY_QUIET, type Scheduler } from "../scheduler.ts";
-import { KEY_WORKER_MODEL, UserError, type Tasks } from "../tasks.ts";
+import type { Subagents } from "../subagents.ts";
+import { UserError, type Tasks } from "../tasks.ts";
 import { startOfLocalDay, startOfLocalMonth, usd } from "../text.ts";
 import type { MediaKind, MediaProcessor } from "../media.ts";
 
@@ -39,17 +44,22 @@ export type BotDeps = {
   approvals: Approvals;
   scheduler: Scheduler;
   labelFor: (sessionID: string) => string;
+  roles: Roles;
+  limits: Limits;
+  catalog: Catalog;
+  subagents: Subagents;
   media?: MediaProcessor;
 };
 
 const HELP = `Just text me like you would a person: ask questions, hand me work, ask how things are going.
 
-Long jobs run in the background and I'll tell you when they're done. When something needs your OK you'll get buttons.
+Long jobs run in the background and I'll tell you when they're done. Quick lookups and analysis go to subagents on cheaper or stronger models, picked for the job. When something needs your OK you'll get buttons.
 
-/tasks: background work
+/tasks: background work and subagents
 /stop: interrupt me · /stop <task>: stop a task
 /new: clean chat (ask me to pick up where we left off)
-/model: switch models
+/model: what the chat, workers and each subagent kind run on
+/limits: spending caps
 /cost: spend so far
 /quiet on|off|auto|today: hold non-urgent updates
 /actions: recent outward-facing actions`;
@@ -61,6 +71,8 @@ export const COMMAND_MENU = [
   { command: "new", description: "Clean chat" },
   { command: "quiet", description: "Hold non-urgent updates" },
   { command: "cost", description: "Spend so far" },
+  { command: "limits", description: "Spending caps" },
+  { command: "model", description: "Models per role" },
   { command: "help", description: "What I can do" },
 ];
 
@@ -70,9 +82,8 @@ export function createBot(token: string) {
   return bot;
 }
 
-type Target = "c" | "w";
-const TARGET_NAME: Record<Target, string> = { c: "chat", w: "workers" };
-const targetKey = (t: Target) => (t === "c" ? KEY_CHAT_MODEL : KEY_WORKER_MODEL);
+const roleName = (id: string) => (id === "chat" ? "Chat" : id === "workers" ? "Workers" : id === "every" ? "All subagents" : `Subagent ${id}`);
+const isAuto = (v: string | undefined) => v === "auto" || v === "default";
 
 export function registerHandlers(bot: Bot, d: BotDeps) {
   // Owner-only, private chat only. Everyone else is ignored.
@@ -88,7 +99,19 @@ export function registerHandlers(bot: Bot, d: BotDeps) {
   bot.command("help", (ctx) => ctx.reply(HELP));
 
   bot.command("tasks", async (ctx) => {
-    await ctx.reply(await d.tasks.list(72));
+    const delegations = d.subagents.list(72);
+    await ctx.reply([await d.tasks.list(72), delegations].filter(Boolean).join("\n\n"));
+  });
+
+  bot.command("limits", async (ctx) => {
+    const [name, raw] = ctx.match.trim().split(/\s+/).filter(Boolean);
+    if (!name) return void (await ctx.reply(d.limits.describe()));
+    if (!isCapName(name)) return void (await ctx.reply(`No cap called "${name}".\n\n${d.limits.describe()}`));
+    if (raw === undefined) return void (await ctx.reply(`${name}: ${d.limits.get(name)} (ceiling ${d.limits.ceiling(name)})`));
+    const value = raw === "default" || raw === "reset" ? undefined : Number(raw.replace(/^\$/, ""));
+    if (value !== undefined && !Number.isFinite(value)) return void (await ctx.reply("Give a number, e.g. /limits daily 10, or /limits daily default."));
+    const res = d.limits.set(name, value);
+    await ctx.reply(`${name} is now ${res.value}${res.clamped ? " — that's its ceiling from the env; raise the env value to go higher" : ""}.`);
   });
 
   bot.command("actions", async (ctx) => {
@@ -132,12 +155,14 @@ export function registerHandlers(bot: Bot, d: BotDeps) {
         .then((b) => [`crowbot balance: ${usd(b.balanceUsd)}`])
         .catch((err) => [`crowbot balance: unavailable (${(err as Error).message})`]);
     }
+    const byKind = d.store.subagentSpendByKindSince(startOfLocalDay()).map((r) => `- ${r.kind}: ${usd(r.total)}`);
     await ctx.reply(
       [
-        `Today: ${usd(today)} (budget ${usd(d.cfg.DAILY_BUDGET_USD)})`,
-        `This month: ${usd(month)}`,
+        `Today: ${usd(today)} (budget ${usd(d.limits.get("daily"))})`,
+        `This month: ${usd(month)} (budget ${usd(d.limits.get("monthly"))})`,
         ...balance,
         ...(top.length ? ["", "Today by thread:", ...top] : []),
+        ...(byKind.length ? ["", `Subagents today (budget ${usd(d.limits.get("subagents"))}):`, ...byKind] : []),
       ].join("\n"),
     );
   });
@@ -157,16 +182,16 @@ export function registerHandlers(bot: Bot, d: BotDeps) {
   });
 
   bot.command("model", async (ctx) => {
-    const [target, ref] = ctx.match.trim().split(/\s+/);
-    if (target && ref && (target === "chat" || target === "workers")) {
-      const choices = await modelChoices(d);
-      if (ref !== "default" && !choices.includes(ref)) return void (await ctx.reply(`Unknown model "${ref}". Try /model to pick from a list.`));
-      const key = target === "chat" ? KEY_CHAT_MODEL : KEY_WORKER_MODEL;
-      if (ref === "default") d.store.delete(key);
-      else d.store.set(key, ref);
-      return void (await ctx.reply(`${target === "chat" ? "Chat" : "Workers"} now use ${ref === "default" ? "the default model" : ref}.`));
+    const [role, second, third] = ctx.match.trim().split(/\s+/).filter(Boolean);
+    if (role && second) {
+      if (second === "effort") {
+        d.roles.setEffort(role, isAuto(third) || !third ? undefined : third);
+      } else {
+        d.roles.setModel(role, isAuto(second) ? undefined : second);
+      }
+      return void (await ctx.reply(`${roleName(role)}: ${d.roles.describe(role)}`));
     }
-    await ctx.reply(modelSummary(d), { reply_markup: new InlineKeyboard().text("Change chat model", "mt:c").text("Change worker model", "mt:w") });
+    await ctx.reply(modelSummary(d), { reply_markup: rolesKeyboard(d) });
   });
 
   bot.on("callback_query:data", async (ctx) => {
@@ -214,9 +239,30 @@ export function registerHandlers(bot: Bot, d: BotDeps) {
 }
 
 function modelSummary(d: BotDeps) {
-  const chat = d.store.get(KEY_CHAT_MODEL) ?? d.cfg.CHAT_MODEL ?? "the assistant agent's default (opencode.json)";
-  const worker = d.store.get(KEY_WORKER_MODEL) ?? d.cfg.WORKER_MODEL ?? "the worker agent's default (opencode.json)";
-  return `Chat: ${chat}\nWorkers: ${worker}\n\nTip: /model chat provider/model sets one directly; "default" resets.`;
+  return [
+    ...d.roles.ids().map((id) => `${roleName(id)}: ${d.roles.describe(id)}`),
+    "",
+    "All subagents sets the default for every kind; a kind's own pick overrides it. Tap a role to change it, or type " +
+      "/model <role> <provider/model|auto> and /model <role> effort <low|medium|high|auto> (roles: chat, every, a kind, workers).",
+  ].join("\n");
+}
+
+/** One button per role; the role list is snapshotted so button indexes stay valid. */
+function rolesKeyboard(d: BotDeps) {
+  const ids = d.roles.ids();
+  d.store.set("model.roles", JSON.stringify(ids));
+  const kb = new InlineKeyboard();
+  ids.forEach((id, i) => {
+    kb.text(roleName(id), `mr:${i}`);
+    if (i % 2 === 1) kb.row();
+  });
+  return kb;
+}
+
+function roleAt(d: BotDeps, index: string | undefined): string {
+  const role = (JSON.parse(d.store.get("model.roles") ?? "[]") as string[])[Number(index)];
+  if (!role || !d.roles.has(role)) throw new UserError("That list is out of date, run /model again.");
+  return role;
 }
 
 async function modelChoices(d: BotDeps): Promise<string[]> {
@@ -249,26 +295,44 @@ async function handleCallback(ctx: Context, d: BotDeps, kind: string, rest: stri
       }
       return "Unknown button";
     }
-    case "mt": {
-      const target = rest[0] as Target;
-      const choices = (await modelChoices(d)).slice(0, 40);
+    case "mr": {
+      // A role was tapped: its model list (workers and kinds only see usable, priced models).
+      const role = roleAt(d, rest[0]);
+      const choices = (role === "chat" ? await modelChoices(d) : d.catalog.usable().map((m) => m.ref)).slice(0, 40);
       d.store.set("model.choices", JSON.stringify(choices));
       const kb = new InlineKeyboard();
-      choices.forEach((c, i) => kb.text(c, `ms:${target}:${i}`).row());
-      kb.text("↺ Default", `ms:${target}:-1`);
-      await ctx.editMessageText(`Pick the ${TARGET_NAME[target]} model:`, { reply_markup: kb });
+      choices.forEach((c, i) => {
+        const info = d.catalog.get(c);
+        kb.text(info ? `${c} · ${priceLabel(info)}` : c, `mp:${rest[0]}:${i}`).row();
+      });
+      kb.text("↺ Auto", `mp:${rest[0]}:-1`).text("Effort…", `me:${rest[0]}`);
+      await ctx.editMessageText(`${roleName(role)} runs on ${d.roles.describe(role)}.\nPick a model (prices per 1M tokens in/out):`, { reply_markup: kb });
       return undefined;
     }
-    case "ms": {
-      const target = rest[0] as Target;
+    case "mp": {
+      const role = roleAt(d, rest[0]);
       const index = Number(rest[1]);
-      if (index < 0) d.store.delete(targetKey(target));
+      if (index < 0) d.roles.setModel(role, undefined);
       else {
         const choice = (JSON.parse(d.store.get("model.choices") ?? "[]") as string[])[index];
         if (!choice) throw new UserError("That list is out of date, run /model again.");
-        d.store.set(targetKey(target), choice);
+        d.roles.setModel(role, choice);
       }
-      await ctx.editMessageText(modelSummary(d));
+      await ctx.editMessageText(modelSummary(d), { reply_markup: rolesKeyboard(d) });
+      return "Saved";
+    }
+    case "me": {
+      const role = roleAt(d, rest[0]);
+      const kb = new InlineKeyboard();
+      for (const e of EFFORTS) kb.text(e, `mf:${rest[0]}:${e}`);
+      kb.text("↺ Auto", `mf:${rest[0]}:auto`);
+      await ctx.editMessageText(`Effort for ${roleName(role)} (now ${d.roles.describe(role)}). Higher effort reasons longer and costs more:`, { reply_markup: kb });
+      return undefined;
+    }
+    case "mf": {
+      const role = roleAt(d, rest[0]);
+      d.roles.setEffort(role, isAuto(rest[1]) ? undefined : rest[1]);
+      await ctx.editMessageText(modelSummary(d), { reply_markup: rolesKeyboard(d) });
       return "Saved";
     }
     default:

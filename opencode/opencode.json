@@ -16,10 +16,18 @@
         "apiKey": "{env:CROWBOT_API_KEY}"
       },
       "models": {
-        "deepseek-v4.1-flash": {"name":"DeepSeek V4.1 Flash","limit":{"context":1048576,"output":128000},"cost":{"input":0.045,"output":0.18,"cache_read":0.0009},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
-        "gpt-6.1-sol": {"name":"GPT 6.1 Sol","limit":{"context":1048576,"output":128000},"cost":{"input":0.18,"output":0.9,"cache_read":0.009},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
+        "crow-2": {"name":"GLM 5.3 [UNCENSORED]","limit":{"context":1000000,"output":32768},"cost":{"input":3.5,"output":5,"cache_read":0.5},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
+        "deepseek-v4.1-flash": {"name":"DeepSeek V4.1 Flash 1017 [CHEAP]","limit":{"context":1048576,"output":128000},"cost":{"input":0.03,"output":0.12,"cache_read":0.0006},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
+        "deepseek-v4.1-flash-1017-crow": {"name":"DeepSeek V4.1 Flash 1017 [UNCENSORED]","limit":{"context":1000000,"output":32768},"cost":{"input":0.19,"output":0.65,"cache_read":0.025},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
+        "gemini-3.8-flash": {"name":"Gemini 3.8 Flash","limit":{"context":1048576,"output":65536},"cost":{"input":0.0675,"output":0.3375,"cache_read":0.0067},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
+        "gemini-4-argon": {"name":"Gemini 4 Argon","limit":{"context":1048576,"output":65536},"cost":{"input":0.3,"output":1.5,"cache_read":0.015},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
+        "glm-5.3-flash-crow": {"name":"GLM 5.3 Flash [UNCENSORED]","limit":{"context":1048576,"output":32768},"cost":{"input":0.2,"output":0.6,"cache_read":0.1},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
+        "gpt-6-sol": {"name":"GPT 6 Sol","limit":{"context":1048576,"output":128000},"cost":{"input":0.2,"output":1,"cache_read":0.02},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
+        "gpt-6.1-sol": {"name":"GPT 6.1 Sol","limit":{"context":1048576,"output":128000},"cost":{"input":0.14,"output":0.7,"cache_read":0.007},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
         "kimi-k3": {"name":"Kimi K3","limit":{"context":1048576,"output":1048576},"cost":{"input":0.27,"output":1.35,"cache_read":0.027},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
-        "crow-2": {"name":"GLM 5.3 [UNCENSORED]","limit":{"context":1000000,"output":32768},"cost":{"input":5,"output":5,"cache_read":0.5},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false}
+        "mimo-2.6-flash-crow": {"name":"MiMo 2.6 Flash [UNCENSORED]","limit":{"context":1048576,"output":32768},"cost":{"input":1,"output":1.5,"cache_read":0.5},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
+        "odin": {"name":"Odin","limit":{"context":1048576,"output":32768},"cost":{"input":0.9,"output":2.4,"cache_read":0.025},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false},
+        "qwen-3.8-crow": {"name":"Qwen 3.8 [UNCENSORED]","limit":{"context":524288,"output":32768},"cost":{"input":0.85,"output":2.55,"cache_read":0.25},"tool_call":true,"reasoning":true,"interleaved":"reasoning_content","temperature":true,"attachment":false}
       }
     }
   },
@@ -31,11 +39,12 @@
         "Authorization": "Bearer {env:HQ_MCP_TOKEN}"
       },
       "oauth": false,
-      "timeout": 15000
+      "timeout": 150000
     }
   },
   "tools": {
-    "hq_*": false
+    "hq_*": false,
+    "task": false
   },
   "agent": {
     "assistant": {
@@ -52,6 +61,24 @@
       "mode": "primary",
       "prompt": "{file:./prompts/worker.md}",
       "model": "crowbot/deepseek-v4.1-flash"
+    },
+    "explore": {
+      "description": "Finds things and reports them: searches and reads files and the web, changes nothing.",
+      "mode": "subagent",
+      "prompt": "{file:./prompts/subagents/explore.md}",
+      "tools": { "edit": false, "write": false, "bash": false, "question": false, "execute": false }
+    },
+    "research": {
+      "description": "Researches a question across several web sources and returns a short, cited summary. Changes nothing.",
+      "mode": "subagent",
+      "prompt": "{file:./prompts/subagents/research.md}",
+      "tools": { "edit": false, "write": false, "bash": false, "question": false, "execute": false }
+    },
+    "analyst": {
+      "description": "Thinks hard about one question, plan, document or piece of code and gives a reasoned answer or review. Changes nothing.",
+      "mode": "subagent",
+      "prompt": "{file:./prompts/subagents/analyst.md}",
+      "tools": { "edit": false, "write": false, "bash": false, "question": false, "execute": false }
     }
   },
   "permission": {

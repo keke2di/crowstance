@@ -34,10 +34,13 @@ bash -n deploy/*.sh
 git diff --check
 ```
 
-`npm test` must pass in full. New behaviour needs a test in the existing isolated-fixture
-style: temporary directories, file-backed SQLite where recovery matters, and fakes for
-OpenCode, Telegram and the geocoder. Tests must not use the network, root, real systemd, real
-Telegram, or any secret file.
+`npm test` must pass in full. The suites in `test/deploy/` run the real deploy scripts (bash,
+symlinks, file modes) and are skipped on Windows; if you develop on Windows and touch `deploy/`,
+run the full suite in WSL or on Linux before committing.
+
+New behaviour needs a test in the existing isolated-fixture style: temporary directories,
+file-backed SQLite where recovery matters, and fakes for OpenCode, Telegram and the geocoder.
+Tests must not use the network, root, real systemd, real Telegram, or any secret file.
 
 ## Style
 
@@ -68,6 +71,7 @@ User- and operator-facing behaviour belongs in `README.md`; deeper material belo
 - `docs/ARCHITECTURE.md` — system design, data flow, trust boundaries.
 - `docs/MODULES.md` — per-file responsibilities.
 - `docs/OPERATIONS.md` — runbooks (health, upgrade, rollback, incident, privacy, recovery).
+- `docs/SUBAGENTS.md` — subagents, model choice, the model catalog and spend caps.
 - `docs/CONTRIBUTING.md` — this file.
 
 Runbook bash blocks are syntax-checked by the test suite, so keep commands real and valid.

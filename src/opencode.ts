@@ -35,7 +35,8 @@ export type Session = {
 
 export type TokenUsage = { input: number; output: number; reasoning: number; cache: { read: number; write: number } };
 export type ModelRefFull = { id: string; providerID: string; variant?: string };
-export type ModelRef = { providerID: string; modelID: string };
+/** `variant` is the reasoning effort (OpenCode sends it to the provider as `reasoning_effort`). */
+export type ModelRef = { providerID: string; modelID: string; variant?: string };
 
 export type StructuredError = { type: string; message: string; status?: number; response?: { body: string } };
 
@@ -66,8 +67,24 @@ export type Message =
 export type SessionMessagesResponse = { data: Message[]; cursor: { previous: string | null; next: string | null } };
 
 export type AgentInfo = { id: string; name: string; model?: ModelRefFull; mode: "subagent" | "primary" | "all"; hidden: boolean; description?: string };
-export type ModelInfo = { id: string; modelID: string; providerID: string; name?: string; variants?: { id: string }[] };
+export type ModelInfo = {
+  id: string;
+  modelID: string;
+  providerID: string;
+  name?: string;
+  variants?: { id: string }[];
+  /** USD per 1M tokens, as configured in opencode.json (or OpenCode's own registry). 2.0.32 sends a list of price tiers. */
+  cost?: ModelCost | ModelCost[];
+  capabilities?: { tools?: boolean; reasoning?: boolean; toolcall?: boolean; tool_call?: boolean; [k: string]: unknown };
+  limit?: { context?: number; output?: number };
+};
+export type ModelCost = { input?: number; output?: number; cache?: { read?: number; write?: number } };
 export type ProviderInfo = { id: string; name?: string };
+
+/** A model's base price (the first tier when OpenCode lists several). */
+export function modelCost(m: Pick<ModelInfo, "cost">): ModelCost | undefined {
+  return Array.isArray(m.cost) ? m.cost[0] : m.cost;
+}
 
 export type PermissionRequest = {
   id: string;
@@ -140,7 +157,7 @@ export class OpenCode {
 
   private async request<T>(method: string, route: string, opts: { directory?: string; query?: Record<string, string | undefined>; body?: unknown; raw?: boolean } = {}): Promise<T> {
     const url = new URL(`/api${route}`, this.url);
-    if (opts.directory) url.searchParams.set("directory", opts.directory);
+    if (opts.directory) setDirectory(url, opts.directory);
     for (const [k, v] of Object.entries(opts.query ?? {})) if (v !== undefined) url.searchParams.set(k, v);
     const res = await fetch(url, {
       method,
@@ -189,9 +206,20 @@ export class OpenCode {
 
   // ---- sessions ----
 
-  async createSession(p: { directory: string; title: string; agent?: string; metadata?: Record<string, unknown> }): Promise<Session> {
+  /**
+   * OpenCode 2 ignores an agent's configured `model`: a session runs on the global default unless
+   * one is given here or switched to later, so callers pass the model they mean.
+   */
+  async createSession(p: { directory: string; title: string; agent?: string; metadata?: Record<string, unknown>; parentID?: string; model?: ModelRef }): Promise<Session> {
     const res = await this.post<{ data: Session }>("/session", {
-      body: { title: p.title, agent: p.agent, metadata: p.metadata, location: { directory: p.directory } },
+      body: {
+        title: p.title,
+        agent: p.agent,
+        metadata: p.metadata,
+        location: { directory: p.directory },
+        ...(p.parentID ? { parentID: p.parentID } : {}),
+        ...(p.model ? { model: wireModel(p.model) } : {}),
+      },
     });
     return res.data;
   }
@@ -211,7 +239,7 @@ export class OpenCode {
     const text = p.parts.map((part) => part.text ?? "").join("");
     log.debug(`prompt → session ${p.sessionID}`, { agent: p.agent });
     if (p.agent) await this.post(`/session/${p.sessionID}/agent`, { directory: p.directory, body: { agent: p.agent } });
-    if (p.model) await this.switchModel(p.sessionID, p.model);
+    if (p.model) await this.switchModel(p.sessionID, p.variant && !p.model.variant ? { ...p.model, variant: p.variant } : p.model);
     const body: Record<string, unknown> = { text };
     // `synthetic` marks system/context-only inserts (rotation handoffs etc.).
     if (p.noReply) body.metadata = { hq: { noReply: true } };
@@ -220,7 +248,7 @@ export class OpenCode {
   }
 
   async switchModel(sessionID: string, model: ModelRef) {
-    await this.post(`/session/${sessionID}/model`, { body: { model: { id: model.modelID, providerID: model.providerID } } });
+    await this.post(`/session/${sessionID}/model`, { body: { model: wireModel(model) } });
   }
 
   async interrupt(sessionID: string, directory: string) {
@@ -232,12 +260,16 @@ export class OpenCode {
     await this.interrupt(sessionID, directory);
   }
 
+  /**
+   * The newest `limit` messages, oldest first. (`order` picks which end the page comes from:
+   * `asc` with a limit would return the session's *first* messages.)
+   */
   async messages(sessionID: string, directory: string, limit?: number): Promise<Message[]> {
     const res = await this.get<SessionMessagesResponse>(`/session/${sessionID}/message`, {
       directory,
-      query: { limit: limit === undefined ? undefined : String(limit), order: "asc" },
+      query: { limit: limit === undefined ? undefined : String(limit), order: limit === undefined ? "asc" : "desc" },
     });
-    return res.data;
+    return limit === undefined ? res.data : [...res.data].reverse();
   }
 
   /** Pending (undelivered) inbox items: non-empty means the session is busy. */
@@ -251,14 +283,31 @@ export class OpenCode {
     }
   }
 
-  /** sessionID → busy, for every active session in `directory` (inbox non-empty = busy). */
+  /**
+   * Busy or idle. The inbox empties as soon as a prompt is delivered, so it only shows queued work;
+   * a running execution shows in the message list instead. A finished run ends with an `idle`
+   * entry, or (when it was interrupted, e.g. a denied permission) with a completed assistant
+   * message that isn't waiting on tool calls. Undefined when the session doesn't exist.
+   */
+  async sessionStatus(sessionID: string, directory: string): Promise<{ type: "busy" | "idle" } | undefined> {
+    const pending = await this.inbox(sessionID, directory).catch(() => [] as InboxItem[]);
+    if (pending.length > 0) return { type: "busy" };
+    try {
+      return { type: runFinished((await this.messages(sessionID, directory, 1))[0]) ? "idle" : "busy" };
+    } catch (err) {
+      if (statusOf(err) === 404) return undefined;
+      throw err;
+    }
+  }
+
+  /** sessionID → busy/idle for every session in `directory`. */
   async statuses(directory: string): Promise<Record<string, { type: "busy" | "idle" }>> {
     const sessions = await this.listSessions(directory);
     const out: Record<string, { type: "busy" | "idle" }> = {};
     await Promise.all(
       sessions.map(async (s) => {
-        const pending = await this.inbox(s.id, directory).catch(() => [] as InboxItem[]);
-        out[s.id] = { type: pending.length > 0 ? "busy" : "idle" };
+        const status = await this.sessionStatus(s.id, directory).catch(() => undefined);
+        if (status) out[s.id] = status;
       }),
     );
     return out;
@@ -322,6 +371,12 @@ export class OpenCode {
     }
   }
 
+  /** Every pending form in a directory, whichever session asked. */
+  async formsIn(directory: string): Promise<FormRequest[]> {
+    const res = await this.get<{ data: FormRequest[] }>("/form", { directory });
+    return res.data.filter((f) => !f.state || f.state.status === "pending");
+  }
+
   async replyForm(sessionID: string, formID: string, answer: Record<string, unknown>) {
     await this.post(`/session/${sessionID}/form/${formID}/reply`, { body: { answer } });
   }
@@ -336,9 +391,9 @@ export class OpenCode {
   /** A text file as the OpenCode server's user sees it (undefined if missing/unreadable). */
   async readFile(directory: string, relPath: string): Promise<string | undefined> {
     try {
-      const res = await fetch(new URL(`/api/fs/read/${relPath.split("/").map(encodeURIComponent).join("/")}?directory=${encodeURIComponent(directory)}`, this.url), {
-        headers: this.headers,
-      });
+      const url = new URL(`/api/fs/read/${relPath.split("/").map(encodeURIComponent).join("/")}`, this.url);
+      setDirectory(url, directory);
+      const res = await fetch(url, { headers: this.headers });
       if (!res.ok) return undefined;
       return await res.text();
     } catch {
@@ -386,7 +441,7 @@ export class OpenCode {
 
   private async hasEntry(parent: string, rel: string, name: string) {
     try {
-      return (await this.listDir(parent, rel)).some((e) => (e.name ?? e.path.split(/[\\/]/).pop()) === name);
+      return (await this.listDir(parent, rel)).some((e) => entryName(e) === name);
     } catch {
       return false; // the directory doesn't exist (yet)
     }
@@ -416,6 +471,16 @@ export class OpenCode {
 
   async mcpConnect(name: string, directory: string) {
     await this.post(`/experimental/mcp/${name}/connect`, { directory });
+  }
+
+  async mcpDisconnect(name: string, directory: string) {
+    await this.post(`/experimental/mcp/${name}/disconnect`, { directory });
+  }
+
+  /** OpenCode lists an MCP server's tools when it connects and keeps that list; reconnect to make it list them again. */
+  async mcpReconnect(name: string, directory: string) {
+    await this.mcpDisconnect(name, directory).catch(() => {});
+    await this.mcpConnect(name, directory);
   }
 
   // ---- events ----
@@ -473,6 +538,35 @@ export function sleep(ms: number, signal?: AbortSignal) {
 
 // ---- helpers over OpenCode data ----
 
+/**
+ * Scope a request to a directory. Most v2 routes read it as `location[directory]`; GET /api/session
+ * reads `directory`. A route ignores the one it doesn't know and falls back to OpenCode's own
+ * working directory, so both are sent.
+ */
+function setDirectory(url: URL, directory: string) {
+  url.searchParams.set("directory", directory);
+  url.searchParams.set("location[directory]", directory);
+}
+
+/** A directory entry's own name. OpenCode 2 lists directories with a trailing separator ("memory/" or "memory\\"). */
+export function entryName(e: FileEntry): string {
+  return e.name ?? e.path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "";
+}
+
+function wireModel(model: ModelRef) {
+  return { id: model.modelID, providerID: model.providerID, ...(model.variant ? { variant: model.variant } : {}) };
+}
+
+/** The answer a finished run gave: the text of the last assistant message that has any. */
+export function lastReply(msgs: Message[]): { text: string; message?: Extract<Message, { type: "assistant" }> } {
+  const assistants = msgs.filter(isAssistant);
+  for (let i = assistants.length - 1; i >= 0; i--) {
+    const text = messageText(assistants[i]!);
+    if (text) return { text, message: assistants[i] };
+  }
+  return { text: "", message: assistants.at(-1) };
+}
+
 export function isAssistant(m: Message): m is Extract<Message, { type: "assistant" }> {
   return m.type === "assistant";
 }
@@ -485,6 +579,19 @@ export function messageText(m: Message | AssistantContent[]): string {
     .map((p) => p.text.trim())
     .filter(Boolean)
     .join("\n\n");
+}
+
+/** Whether the newest message of a session means no run is in progress. */
+export function runFinished(newest: Message | undefined): boolean {
+  if (!newest || newest.type === "idle") return true;
+  if (!isAssistant(newest)) return false;
+  if (newest.error) return true;
+  return newest.time?.completed !== undefined && newest.finish !== "tool-calls";
+}
+
+/** An interrupt (the stop button, a cap), not a failure: v1 called it MessageAbortedError, 2.x `aborted`. */
+export function isAbortError(text: string | undefined): boolean {
+  return !!text && /^(MessageAbortedError|aborted)\b/i.test(text);
 }
 
 export function errorText(m: Message): string | undefined {

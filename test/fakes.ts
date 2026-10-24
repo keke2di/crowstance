@@ -2,7 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import { loadConfig, type Config } from "../src/config.ts";
 import { Store } from "../src/db.ts";
-import type { FormRequest, Message, OpenCode, PermissionRequest, Session } from "../src/opencode.ts";
+import type { AgentInfo, FormRequest, Message, ModelInfo, ModelRef, OpenCode, PermissionRequest, Session } from "../src/opencode.ts";
 import type { Chat, SendOpts, SendResult } from "../src/telegram/chat.ts";
 
 export function testConfig(overrides: Record<string, string> = {}): Config {
@@ -67,6 +67,31 @@ export function formRequest(p: { id?: string; sessionID?: string; questions?: { 
   };
 }
 
+export function fakeModel(providerID: string, id: string, input: number, output: number, reasoning = true): ModelInfo {
+  // The shape OpenCode 2.0.32 sends: cost is a list of price tiers, capabilities say `tools`, effort levels are variants.
+  return { id, modelID: id, providerID, name: id, cost: [{ input, output, cache: { read: input / 10, write: 0 } }], capabilities: { tools: true }, variants: reasoning ? [{ id: "low" }, { id: "medium" }, { id: "high" }] : [], limit: { context: 1_000_000 } };
+}
+
+/** A crowbot `/v1/models` listing for the catalog. */
+export function crowbotListing(models: { id: string; input: number; output: number; reasoning?: boolean; tools?: boolean; context?: number }[]) {
+  return {
+    object: "list",
+    data: models.map((m) => ({
+      id: m.id,
+      display_name: m.id.toUpperCase(),
+      context_window: m.context ?? 1_048_576,
+      max_output_tokens: 32_768,
+      pricing: { input_per_1m_usd: m.input, cached_input_per_1m_usd: m.input / 10, output_per_1m_usd: m.output },
+      capabilities: { reasoning: m.reasoning ?? true, tool_calling: m.tools ?? true },
+    })),
+  };
+}
+
+/** A fetch that answers with `body` (or an HTTP error status). */
+export function fakeFetch(body: unknown, status = 200): typeof fetch {
+  return (async () => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+}
+
 type Prompt = { sessionID: string; directory: string; text: string; agent?: string; model?: unknown; variant?: string; noReply?: boolean };
 
 export class FakeOpenCode {
@@ -101,16 +126,33 @@ export class FakeOpenCode {
   async getSession(id: string) {
     return this.sessions.get(id);
   }
+  agentList: AgentInfo[] = [
+    { id: "assistant", name: "assistant", mode: "primary", hidden: false, model: { providerID: "crowbot", id: "deepseek-v4.1-flash" } },
+    { id: "worker", name: "worker", mode: "primary", hidden: false, model: { providerID: "crowbot", id: "gpt-6-astra" } },
+    { id: "explore", name: "explore", mode: "subagent", hidden: false, description: "Finds things and reports them" },
+    { id: "analyst", name: "analyst", mode: "subagent", hidden: false, description: "Thinks hard about one question" },
+    { id: "title", name: "title", mode: "primary", hidden: true },
+  ];
   async agents() {
-    return [
-      { id: "assistant", name: "assistant", mode: "primary", hidden: false, model: { providerID: "crowbot", id: "deepseek-v4.1-flash" } },
-      { id: "worker", name: "worker", mode: "primary", hidden: false, model: { providerID: "crowbot", id: "gpt-6-astra" } },
-    ];
+    return this.agentList;
   }
-  async createSession(p: { directory: string; title: string }) {
+  /** What OpenCode can run; prices are opencode.json's (USD per 1M). */
+  modelList: ModelInfo[] = [
+    fakeModel("crowbot", "deepseek-v4.1-flash", 0.045, 0.18),
+    fakeModel("crowbot", "gpt-6.1-sol", 0.18, 0.9),
+    fakeModel("crowbot", "kimi-k3", 0.27, 1.35),
+    fakeModel("crowbot", "crow-2", 5, 5),
+    fakeModel("anthropic", "claude-opus-5-5", 5, 25),
+  ];
+  async models() {
+    return this.modelList;
+  }
+  created: { id: string; directory: string; title: string; agent?: string; parentID?: string; model?: ModelRef; metadata?: Record<string, unknown> }[] = [];
+  async createSession(p: { directory: string; title: string; agent?: string; parentID?: string; model?: ModelRef; metadata?: Record<string, unknown> }) {
     if (this.createSessionDelay) await new Promise((resolve) => setTimeout(resolve, this.createSessionDelay));
     const s = { id: `ses_${this.n++}`, directory: p.directory, title: p.title, cost: 0, projectID: "p", tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, time: { created: Date.now(), updated: Date.now() }, location: { directory: p.directory } };
     this.sessions.set(s.id, s);
+    this.created.push({ id: s.id, ...p });
     return s;
   }
   async prompt(p: { sessionID: string; directory: string; parts: { text?: string }[]; agent?: string; model?: unknown; variant?: string; noReply?: boolean }) {
@@ -158,6 +200,14 @@ export class FakeOpenCode {
   async pendingForms() {
     if (this.failFormList) throw new Error("OpenCode unavailable");
     return this.pendingFs;
+  }
+  async formsIn() {
+    if (this.failFormList) throw new Error("OpenCode unavailable");
+    return this.pendingFs;
+  }
+  /** Busy/idle of one session, from statusMap (undefined = no such session). */
+  async sessionStatus(sessionID: string) {
+    return this.statusMap[sessionID];
   }
 
   reply(sessionID: string, text: string, extra?: { error?: unknown; completed?: boolean }) {

@@ -125,6 +125,8 @@ export class Scheduler {
           `For frequent checks, write a script that calls notify.sh only when something is wrong and register it with monitor_add.`,
       );
     }
+    // A job's model is checked now, not at 3am when the run would fail.
+    this.tasks.checkModel(p.model);
     const job = this.store.upsertJob({ name: p.name, cron: p.cron, instructions: p.instructions, model: p.model ?? null });
     this.arm(job);
     const next = this.crons.get(job.name)?.nextRun();

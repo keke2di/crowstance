@@ -167,7 +167,8 @@ export class Approvals {
       const mark = selected.includes(o.value) ? "☑ " : "☐ ";
       kb.text(truncate(`${mark}${o.label}`, 40), `q:${formID}:${f.key}:${oi}`).row();
     }
-    if (options.length) kb.text("Send ✓", `qd:${formID}:${f.key}`);
+    // A single choice is sent on tap; only a multiselect needs a Send button.
+    if (options.length && f.type === "multiselect") kb.text("Send ✓", `qd:${formID}:${f.key}`);
     kb.text("Dismiss", `qx:${formID}`);
     return kb;
   }
@@ -183,7 +184,8 @@ export class Approvals {
     const current = state.answers[key];
     const selected = Array.isArray(current) ? current : [];
     const multi = field.type === "multiselect";
-    state.answers[key] = multi ? (selected.includes(option.value) ? selected.filter((v) => v !== option.value) : [...selected, option.value]) : [option.value];
+    // OpenCode 2 wants a string for a single-choice field and a list only for a multiselect.
+    state.answers[key] = multi ? (selected.includes(option.value) ? selected.filter((v) => v !== option.value) : [...selected, option.value]) : option.value;
     this.store.updateApproval(requestID, { state: JSON.stringify(state) });
     const msgId = this.messageForField(row, key);
     if (msgId) {
@@ -326,9 +328,15 @@ export class Approvals {
           await this.onPermissionAsked(p, dir);
         }
       }
-      // Forms live per-session; poll them for sessions we track.
-      const sessionIDs = [...new Set(this.store.openApprovals().filter((a) => a.directory === dir).map((a) => a.session_id))];
-      const formLists = await Promise.all(sessionIDs.map((sid) => this.oc.pendingForms(sid, dir).catch(() => [] as FormRequest[])));
+      // Every pending form in the directory, so a question whose event was missed still gets shown.
+      // Without that listing, fall back to polling the sessions we already track.
+      let formLists: FormRequest[][];
+      const all = await this.oc.formsIn(dir).catch(() => undefined);
+      if (all) formLists = [all];
+      else {
+        const sessionIDs = [...new Set(this.store.openApprovals().filter((a) => a.directory === dir).map((a) => a.session_id))];
+        formLists = await Promise.all(sessionIDs.map((sid) => this.oc.pendingForms(sid, dir).catch(() => [] as FormRequest[])));
+      }
       snapshots.add(`${dir}:question`);
       this.store.approvalSnapshot(dir, "question");
       for (const forms of formLists) {

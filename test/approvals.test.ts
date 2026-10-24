@@ -92,7 +92,8 @@ describe("Approvals", () => {
     expect(await approvals.tapOption("que_1", "features", 0)).toBe("Toggled");
     expect(await approvals.tapOption("que_1", "features", 1)).toBe("Toggled");
     expect(await approvals.submitMultiple("que_1", "features")).toBe("Sent");
-    expect(oc.formReplies).toEqual([{ formID: "que_1", answer: { db: ["Postgres"], features: ["auth", "billing"] } }]);
+    // OpenCode 2.0.32 rejects a list for a single-choice field ("Expected string for form field").
+    expect(oc.formReplies).toEqual([{ formID: "que_1", answer: { db: "Postgres", features: ["auth", "billing"] } }]);
   });
 
   it("accepts a free-form answer as a reply to the form message", async () => {
@@ -152,6 +153,14 @@ describe("Approvals", () => {
     expect(chat.html.map((h) => h.html).join()).toContain("git push origin main");
     expect(store.approval("per_old")!.resolution).toBe("expired");
     expect(store.approval("per_1")!.resolved_at).toBeNull();
+  });
+
+  it("shows a question whose event was missed, even from a session with no open approvals", async () => {
+    const { oc, chat, approvals, store } = setup();
+    oc.pendingFs = [{ ...form, id: "frm_missed", sessionID: "ses_never_seen" }];
+    await approvals.reconcile(["/p"]);
+    expect(store.approval("frm_missed")).toMatchObject({ kind: "question", session_id: "ses_never_seen" });
+    expect(chat.html.length).toBeGreaterThan(0);
   });
 
   it("does not expire requests when either list fails", async () => {

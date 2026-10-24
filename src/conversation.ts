@@ -9,11 +9,15 @@ import type { Config } from "./config.ts";
 import { parseModelRef } from "./config.ts";
 import type { Store, UpdateRow } from "./db.ts";
 import { logger, newCorrelationId, runWithCorrelation } from "./log.ts";
-import { errorText, messageText, type Message, type ModelRef, type OpenCode } from "./opencode.ts";
+import { errorText, isAbortError, messageText, type Message, type ModelRef, type OpenCode } from "./opencode.ts";
 import type { Chat } from "./telegram/chat.ts";
 import { Delivery } from "./delivery.ts";
 import { isNoReply, stamp, stripNoReply, truncate } from "./text.ts";
 import { completeBrief, isClearlyBigRequest, reserveReasoning } from "./reasoning.ts";
+import { BudgetError } from "./errors.ts";
+import type { Limits } from "./limits.ts";
+import { KEY_CHAT_MODEL, type Roles } from "./roles.ts";
+import type { Subagents } from "./subagents.ts";
 import crypto from "node:crypto";
 
 const log = logger("conversation");
@@ -31,7 +35,7 @@ const KEY_ACTIVITY = "main.lastActivity";
 const KEY_CONTEXT = "main.contextTokens";
 /** User turns in the current main session (nothing to compact when 0). */
 const KEY_USER_TURNS = "main.userTurns";
-export const KEY_CHAT_MODEL = "model.chat";
+export { KEY_CHAT_MODEL } from "./roles.ts";
 export const HANDOFF_FILE = "memory/handoff.md";
 
 /** Provider hiccups worth one automatic retry before bothering the user. */
@@ -110,6 +114,21 @@ export class Conversation {
     this.buffer = this.store.bufferedInbound().map((m) => ({ id: m.id, text: m.text, at: new Date(m.received_at), ...(m.reply_to ? { replyTo: m.reply_to } : {}), correlationId: m.correlation_id ?? newCorrelationId("in") }));
   }
   private readonly delegate?: (title: string, brief: string) => Promise<{ slug: string }>;
+  private roles?: Roles;
+  private limits?: Limits;
+  private subagents?: Subagents;
+
+  /** Wired after construction: these need the conversation themselves (the main session is a subagent's parent). */
+  attach(deps: { roles?: Roles; limits?: Limits; subagents?: Subagents }) {
+    if (deps.roles) this.roles = deps.roles;
+    if (deps.limits) this.limits = deps.limits;
+    if (deps.subagents) this.subagents = deps.subagents;
+  }
+
+  /** The main session and the turn running in it: a delegation's parent. */
+  currentTurn(): { sessionID?: string; turnID?: number } {
+    return { sessionID: this.sessionID, ...(this.busy && this.turnID !== undefined ? { turnID: this.turnID } : {}) };
+  }
 
   get directory() {
     return this.cfg.ASSISTANT_HOME;
@@ -153,7 +172,12 @@ export class Conversation {
     return session.id;
   }
 
+  /**
+   * The model the chat is sent with. OpenCode ignores an agent's configured model, so the agent's
+   * default from opencode.json is sent explicitly too (roles.ts).
+   */
   chatModel(): ModelRef | undefined {
+    if (this.roles) return this.roles.resolve("chat").model;
     const ref = this.store.get(KEY_CHAT_MODEL) ?? this.cfg.CHAT_MODEL;
     return ref ? parseModelRef(ref) : undefined;
   }
@@ -162,6 +186,10 @@ export class Conversation {
 
   /** "provider/model" the main session runs on: the /model choice, else the agent's default from opencode.json. */
   async chatModelLabel(): Promise<string | undefined> {
+    if (this.roles) {
+      const r = this.roles.resolve("chat");
+      if (r.ref) return r.ref;
+    }
     const ref = this.store.get(KEY_CHAT_MODEL) ?? this.cfg.CHAT_MODEL;
     if (ref) return ref;
     if (this.agentDefaultModel === undefined) {
@@ -219,7 +247,9 @@ export class Conversation {
       } catch (err) {
         this.buffer.unshift(...batch);
         const message = (err as Error).message;
-        if (/budget would be exceeded/i.test(message)) {
+        if (err instanceof BudgetError) {
+          await this.notifyOnce("budget", `⚠️ ${message} I'll answer as soon as the budget allows (/limits shows the caps).`, 6 * 3_600_000);
+        } else if (/budget would be exceeded/i.test(message)) {
           await this.notifyOnce(
             "budget",
             "⚠️ I've used up today's reasoning budget. I'll answer when it resets at midnight, or sooner if you raise REASONING_DAILY_BUDGET_USD.",
@@ -249,7 +279,13 @@ export class Conversation {
     const updates = this.store.pendingUpdates().filter((u) => u.urgent || !this.isQuiet());
     if (updates.length) {
       const correlation = newCorrelationId("upd");
-      await runWithCorrelation(correlation, () => this.send("update", composeUpdateTurn(updates), updates.some((u) => u.urgent), correlation));
+      try {
+        await runWithCorrelation(correlation, () => this.send("update", composeUpdateTurn(updates), updates.some((u) => u.urgent), correlation));
+      } catch (err) {
+        // Over a cap: the updates wait (they're durable) and go out once there is budget again.
+        if (err instanceof BudgetError) return;
+        throw err;
+      }
       this.store.markUpdatesDelivered(updates.map((u) => u.id));
     }
   }
@@ -267,6 +303,8 @@ export class Conversation {
     log.debug(`turn ${turn.id} (${kind}) started`, { correlationId: turn.correlation_id, sessionID });
     if (kind === "user") this.startTyping();
     try {
+      // Rotation turns only save memory; never let a cap block them.
+      if (kind !== "rotate") this.limits?.preflight("chat");
       reserveReasoning(this.store, this.cfg, `turn-${turn.id}-${crypto.randomUUID()}`, sessionID, kind === "update" ? "chat-update" : "chat", text);
       await this.oc.prompt({
         sessionID,
@@ -315,7 +353,7 @@ export class Conversation {
   /** Called after (re)connecting to OpenCode and periodically as a watchdog. */
   async reconcile() {
     const sessionID = await this.run(() => this.ensureMainSession());
-    const status = (await this.oc.statuses(this.directory))[sessionID];
+    const status = await this.oc.sessionStatus(sessionID, this.directory);
     if (!status || status.type === "idle") await this.onMainIdle();
     else this.onMainBusy();
   }
@@ -332,6 +370,7 @@ export class Conversation {
   shouldAutoRotate(now = Date.now()): boolean {
     if (this.cfg.ROTATE_AFTER_HOURS <= 0) return false;
     if (this.busy || this.rotatePending || this.retryPending || this.buffer.length || this.debounce) return false;
+    if (this.subagents?.running().length) return false;
     if (Number(this.store.get(KEY_USER_TURNS) ?? 0) === 0) return false;
     const since = Number(this.store.get(KEY_SINCE) ?? now);
     const activity = Number(this.store.get(KEY_ACTIVITY) ?? since);
@@ -372,7 +411,7 @@ export class Conversation {
     const texts = done.map((m) => messageText(m)).filter(Boolean);
     // A turn that ends in NO_REPLY sends nothing, including any narration before it.
     const reply = texts.length === 0 || isNoReply(texts.at(-1)!) ? "" : stripNoReply(texts.join("\n\n"));
-    const errors = done.map((m) => errorText(m)).filter((e): e is string => !!e && !e.startsWith("MessageAbortedError"));
+    const errors = done.map((m) => errorText(m)).filter((e): e is string => !!e && !isAbortError(e));
     const turn = turnID ? this.store.turn(turnID) : this.store.createTurn(kind ?? "user", urgent, sessionID);
     if (!turn) return;
 
@@ -415,6 +454,7 @@ export class Conversation {
   async abortTurn(): Promise<boolean> {
     const sessionID = this.sessionID;
     if (!sessionID || !this.busy) return false;
+    if (this.turnID !== undefined) await this.subagents?.stopTurn(this.turnID, "stopped", "the user sent /stop");
     await this.oc.abort(sessionID, this.directory);
     return true;
   }
@@ -423,6 +463,8 @@ export class Conversation {
   requestNewSession(): Promise<"ok" | "busy"> {
     return this.run(async () => {
       if (this.busy) return "busy" as const;
+      // A clean slate: answers to the old chat's delegations would land in the new one.
+      await this.subagents?.stopAll("stopped", "the user started a new chat");
       await this.startRotation("manual");
       // Saving takes a model turn, which shows no typing indicator; say what's happening.
       await this.chat.sendText("Saving where we left off, then starting a clean chat…", { bubbles: false });

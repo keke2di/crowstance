@@ -6,6 +6,10 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { describe, expect, it, afterEach } from "vitest";
 
+// These suites run the real deploy scripts: bash, symlinks, file modes and systemd-style layouts.
+// They target the Linux server, so they run on Linux (and CI) and are skipped on Windows.
+const linuxOnly = describe.skipIf(process.platform === "win32");
+
 const run = promisify(execFile);
 const repo = process.cwd();
 const tempRoots: string[] = [];
@@ -172,7 +176,7 @@ async function unpack(fx: { root: string; remote: string }) {
   return out;
 }
 
-describe("atomic deploy, health gate and rollback", () => {
+linuxOnly("atomic deploy, health gate and rollback", () => {
   it("rejects an upload whose checksum manifest does not match", async () => {
     const fx = await makeFixture();
     const archive = join(fx.root, "release.tar.gz");
@@ -356,7 +360,7 @@ describe("atomic deploy, health gate and rollback", () => {
   });
 });
 
-describe("doctor release-state detection", () => {
+linuxOnly("doctor release-state detection", () => {
   async function installHelper(releaseDir: string) {
     await mkdir(join(releaseDir, "deploy"), { recursive: true });
     await writeFile(join(releaseDir, "deploy", "release.sh"), await readFile(join(repo, "deploy", "release.sh"), "utf8"));
@@ -381,7 +385,7 @@ describe("doctor release-state detection", () => {
   });
 });
 
-describe("ssh lockout guard", () => {
+linuxOnly("ssh lockout guard", () => {
   async function sshFixture(overrides: { keys?: string; group?: string; sudoers?: string; sshd?: string }) {
     const root = await tempRoot();
     const passwd = join(root, "passwd");
@@ -459,7 +463,7 @@ describe("ssh lockout guard", () => {
   });
 });
 
-describe("readiness health check", () => {
+linuxOnly("readiness health check", () => {
   async function healthFixture(opts: { systemctlExit?: string } = {}) {
     const root = await tempRoot();
     const bin = join(root, "bin");
@@ -497,7 +501,7 @@ describe("readiness health check", () => {
     expect(await readFile(okLog, "utf8")).toContain("/ready");
   });
 
-  it("checks the OpenCode /global/health endpoint", async () => {
+  it("checks the OpenCode /api/info endpoint", async () => {
     const fx = await healthFixture({});
     const result = await runScript(
       "bash",
@@ -505,7 +509,8 @@ describe("readiness health check", () => {
       { ...fx.env, OPENCODE_URL: "http://127.0.0.1:4096" },
     );
     expect(result.code).toBe(0);
-    expect(await readFile(join(fx.root, "curl.log"), "utf8")).toContain("/global/health");
+    // OpenCode 2 has no /global/health; health-check.sh probes /api/info since the v2 migration.
+    expect(await readFile(join(fx.root, "curl.log"), "utf8")).toContain("/api/info");
   });
 
   it("authenticates to OpenCode without putting the password on the command line", async () => {

@@ -13,6 +13,7 @@
     "opencode": "node scripts/dev-opencode.ts",
     "dev:smoke": "bash scripts/dev-smoke.sh",
     "doctor": "node --env-file-if-exists=.env src/doctor.ts",
+    "models:sync": "node scripts/models-sync.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"

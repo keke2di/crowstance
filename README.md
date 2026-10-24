@@ -160,7 +160,13 @@ Models are configured in `opencode/opencode.json`. The checked-in default is
 and change over time, so treat the checked-in model list as a starting point and check your
 provider for current details.
 
-- **Switch at runtime:** `/model` in Telegram. Chat and workers can use different models.
+- **Subagents.** The chat hands focused lookups and analysis to subagents (`explore`, `research`,
+  `analyst`), each with its own job and tools, and long work to background workers. Each kind runs
+  on its own model and effort, or the default for all subagents (`config/kinds.json`), checked
+  against crowbot's live catalog and your spending caps. `/model` shows and changes any of them;
+  `/limits` sets the caps. Details in `docs/SUBAGENTS.md`.
+- **Keep the model list current:** `npm run models:sync` rewrites the crowbot models in
+  `opencode/opencode.json` from crowbot's catalog; deploy with `--restart-opencode`.
 - **New provider:** the `provider` block in `opencode/opencode.json` is only the default crowbot setup. Replace it with any OpenCode-compatible provider and list the models you want there.
   1. Add its key to `/etc/crowstance/opencode.env`, e.g. `OPENROUTER_API_KEY=…`.
   2. Run `sudo systemctl restart crowstance-opencode`.
@@ -168,17 +174,20 @@ provider for current details.
 - **No Claude Pro/Max subscriptions:** Anthropic's terms limit them to Claude Code and claude.ai. Use an API key with a
   monthly spend cap instead.
 
-`DAILY_BUDGET_USD` (default 20) stops new tasks once the day's spend reaches it. `/cost` shows today and this month.
+Spending is capped per day, per month, per task, per delegation and per chat turn (`DAILY_BUDGET_USD`,
+`MONTHLY_BUDGET_USD`, `TASK_MAX_USD`, `SUBAGENT_*`; see `.env.example`). The env values are ceilings;
+`/limits` can tighten them at runtime. `/cost` shows today and this month, with subagents by kind.
 
 ## Telegram commands
 
 | Command | |
 |---|---|
-| `/tasks` | background work (no model call) |
+| `/tasks` | background work and subagents (no model call) |
 | `/stop` · `/stop <task>` | interrupt the assistant, or stop a task |
 | `/new` | clean chat; the assistant saves memory and where you left off first, and picks it up only when asked |
-| `/model` | show or switch models |
-| `/cost` | spend today and this month |
+| `/model` | what the chat, workers and each subagent kind run on; pin a model or effort |
+| `/limits` | spending caps: show, tighten, reset |
+| `/cost` | spend today and this month, subagents by kind |
 | `/quiet on\|off\|today\|auto` | hold non-urgent updates (`today` until midnight) |
 | `/actions` | recent real-world actions taken on your behalf |
 

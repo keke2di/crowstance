@@ -39,7 +39,7 @@ describe("bounded retention", () => {
 
     const deleted = store.applyRetention({ updatesBefore: now, inboundBefore: now, outboundBefore: now, approvalsBefore: now, turnsBefore: now, attemptsBefore: now });
 
-    expect(deleted).toEqual({ updates: 1, inbound: 1, outbound: 1, approvals: 1, turns: 1, attempts: 1 });
+    expect(deleted).toEqual({ updates: 1, inbound: 1, outbound: 1, approvals: 1, turns: 1, attempts: 1, subagents: 0 });
     // Pending work survives regardless of age.
     expect(store.pendingUpdates().map((u) => u.id)).toEqual([pendingUpdate]);
     expect(store.bufferedInbound().map((m) => m.id)).toEqual([buffered.id]);

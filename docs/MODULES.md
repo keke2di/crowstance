@@ -37,7 +37,7 @@ spend) and `applyRetention()` (bounded terminal history; never pending work).
 Versioned schema migrations (`MIGRATIONS`, `migrate`). v1 core tables; v2 durable ledger; v3
 approval snapshots/presentation; v4 reservations and monitor state; v5 reasoning usage; v6
 correlation ids and retention/metrics indexes; v7 vault + action audit; v8 task-scoped
-permission grants.
+permission grants; v9 per-session running cost totals, subagent runs and `tasks.model_from`.
 
 ### `src/vault.ts`
 Encrypted credential store for real-world actions. AES-256-GCM values with a key file outside
@@ -69,6 +69,38 @@ once as an urgent `system` update. `backoff` is exported for tests.
 Maximum-reasoning policy and cost guard. `reserveReasoning` estimates cost and blocks a turn
 that would exceed `REASONING_DAILY_BUDGET_USD`. `isComplexRequest` is the bounded complexity
 classifier; `completeBrief` builds the self-contained worker brief.
+
+## Subagents, models and caps
+
+See `docs/SUBAGENTS.md` for the design.
+
+### `src/subagents.ts`
+Gateway-owned subagents behind `hq_delegate`. Creates a child session of the main session with
+the kind's agent, model and effort, waits for it to go idle, and returns the last text it wrote.
+Detaches slow delegations (their answer becomes an update), interrupts at the timeout or a cap,
+recovers running delegations after a restart, and lists them for `/tasks`.
+
+### `src/roles.ts`
+The single resolver for which model and effort the chat, all subagents, each kind and the workers
+run on, shaped like crowbot-cli's: a kind's call → your pick for it → its `config/kinds.json`
+entry → your pick for all subagents → `every` → the chat. Refuses unusable or over-ceiling models
+(never a silent fallback). Also stores `/model` picks.
+
+### `src/catalog.ts`
+crowbot's live model catalog (`/v1/models`) crossed with OpenCode's model list: prices,
+capabilities, effort levels, drift detection; cached in `kv`.
+
+### `src/kinds.ts`
+Discovers subagent kinds from OpenCode's agents (retrying the empty list OpenCode returns right
+after it starts), merges `config/kinds.json` (model, effort, `when`, caps) and reads each kind's
+tools from its agent entry in `opencode/opencode.json`.
+
+### `src/limits.ts`
+Spend caps: env ceilings plus `/limits` overrides, preflight refusals, running-total usage
+accounting priced with the catalog, and the breaches `index.ts` enforces; cached crowbot balance.
+
+### `src/errors.ts`
+`UserError` (message safe to show) and `BudgetError` (a cap refused new work).
 
 ## Workers and approvals
 
@@ -148,7 +180,13 @@ no model calls.
 ### `scripts/`
 `dev-opencode.ts` (local OpenCode launcher), `dev-smoke.sh` / `dev-smoke.ts` (stub-model smoke
 harness), `dev-stub-model.ts` (local OpenAI-compatible stub), `vault-add.ts` (operator CLI to
-store vault credentials; reads the value from stdin).
+store vault credentials; reads the value from stdin), `models-sync.ts` (`npm run models:sync`:
+rewrite the crowbot models in `opencode/opencode.json` from the live catalog; `--check` for CI).
+
+### `config/kinds.json`
+What subagents run on: `every` (the default model and effort for all kinds), `workers`, and per
+kind `model`, `effort`, `when`, `max_call_usd`, `timeout_sec` and `enabled`. Only needs a gateway
+restart.
 
 ### `deploy/`
 - `deploy.sh` — operator side: audit, setup, or upload a checksummed update.

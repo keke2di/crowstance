@@ -56,7 +56,37 @@ const Env = z.object({
     .optional(),
   MORNING_CHECKIN: hhmm.optional(),
   DEBOUNCE_MS: z.coerce.number().int().min(0).default(2000),
+  // Spend caps. These are ceilings: /limits can set a stricter value at runtime, never a looser one.
   DAILY_BUDGET_USD: z.coerce.number().positive().default(20),
+  MONTHLY_BUDGET_USD: z.coerce.number().positive().default(200),
+  /** Everything subagents spend in a day. */
+  SUBAGENT_DAILY_BUDGET_USD: z.coerce.number().positive().default(5),
+  /** One hq_delegate call; the subagent is interrupted when it gets there. */
+  SUBAGENT_CALL_MAX_USD: z.coerce.number().positive().default(0.5),
+  /** All delegations started from one chat turn. */
+  SUBAGENT_TURN_MAX_USD: z.coerce.number().positive().default(1.5),
+  /** One background task over its whole life; it is stopped when it gets there. */
+  TASK_MAX_USD: z.coerce.number().positive().default(5),
+  SUBAGENT_MAX_CONCURRENT: z.coerce.number().int().positive().default(3),
+  SUBAGENT_MAX_PER_TURN: z.coerce.number().int().positive().default(6),
+  /** A delegation is interrupted after this long. */
+  SUBAGENT_TIMEOUT_SEC: z.coerce.number().int().positive().default(600),
+  /** The chat waits this long for a delegation; after that its result arrives as an update. */
+  SUBAGENT_SYNC_SEC: z.coerce.number().int().positive().default(120),
+  /** Workers and subagents never run on a model whose blended price (0.75·input + 0.25·output, USD per 1M tokens) is higher. */
+  MODEL_MAX_PRICE_PER_1M: z.coerce.number().positive().default(2),
+  /** New work is refused while the crowbot balance is below this (0 = off). */
+  BALANCE_FLOOR_USD: z.coerce.number().min(0).default(1),
+
+  /** Where the gateway reads crowbot's model catalog (prices, capabilities). */
+  CATALOG_URL: z.url().default("https://api.crowbot.sh/v1/models"),
+  CATALOG_REFRESH_MIN: z.coerce.number().int().positive().default(60),
+  /** The OpenCode provider id the catalog's models live under. */
+  MODEL_PROVIDER: z.string().default("crowbot"),
+  /** Subagent models, effort, jobs and caps. Default: config/kinds.json next to the app. */
+  KINDS_FILE: z.string().default("config/kinds.json"),
+  /** The OpenCode config the kinds' tools are read from (OpenCode enforces them from the same file). */
+  OPENCODE_CONFIG_FILE: z.string().default("opencode/opencode.json"),
   MAX_WORKERS: z.coerce.number().int().positive().default(3),
   MIN_JOB_INTERVAL_MIN: z.coerce.number().int().positive().default(60),
   STUCK_AFTER_MIN: z.coerce.number().int().positive().default(120),
@@ -91,6 +121,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     ASSISTANT_HOME: path.resolve(e.ASSISTANT_HOME),
     PROJECTS_DIR: path.resolve(e.PROJECTS_DIR),
     DATA_DIR: path.resolve(e.DATA_DIR),
+    KINDS_FILE: path.resolve(e.KINDS_FILE),
+    OPENCODE_CONFIG_FILE: path.resolve(e.OPENCODE_CONFIG_FILE),
     quietHours: e.QUIET_HOURS ? parseRange(e.QUIET_HOURS) : undefined,
   };
 }

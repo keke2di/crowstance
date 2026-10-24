@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 const run = promisify(execFile);
 const repo = process.cwd();
 
-const DOCS = ["docs/ARCHITECTURE.md", "docs/MODULES.md", "docs/OPERATIONS.md", "docs/CONTRIBUTING.md"];
+const DOCS = ["docs/ARCHITECTURE.md", "docs/MODULES.md", "docs/OPERATIONS.md", "docs/CONTRIBUTING.md", "docs/SUBAGENTS.md"];
 
 function bashBlocks(markdown: string): string[] {
   return [...markdown.matchAll(/```bash\n([\s\S]*?)```/g)].map((m) => m[1]!);
@@ -28,7 +28,8 @@ describe("operational documentation", () => {
     // The operations runbook is the one that must carry real commands.
     const operations = await readFile(join(repo, "docs/OPERATIONS.md"), "utf8");
     expect(bashBlocks(operations).length).toBeGreaterThanOrEqual(5);
-  });
+    // One bash process per block; on Windows `bash` is WSL's and takes ~200 ms to start.
+  }, 60_000);
 
   it("only references deployment scripts that exist", async () => {
     const referenced = [
